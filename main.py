@@ -195,6 +195,7 @@ class PronoteApp(App):
     def _clean_url(url):
         # Garde seulement .../pronote/eleve.html (enlève ?login=true, etc.)
         url = url.split("?")[0].strip()
+        url = url.replace("mobile.eleve.html", "eleve.html").replace("mobile.parent.html", "parent.html")
         if "eleve.html" not in url and "parent.html" not in url:
             url = url.rstrip("/") + "/eleve.html"
         return url
