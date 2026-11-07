@@ -4,7 +4,7 @@ import random
 import threading
 import uuid
 from datetime import date
- 
+
 from kivy.animation import Animation
 from kivy.app import App
 from kivy.clock import Clock
@@ -21,7 +21,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
- 
+
 BG = (0.05, 0.05, 0.07, 1)
 CARD = (0.10, 0.10, 0.14, 1)
 ACCENT = (0.47, 0.42, 1.0)
@@ -29,30 +29,30 @@ GREY = (0.45, 0.45, 0.52)
 TEXT = (0.93, 0.93, 0.96, 1)
 Window.clearcolor = BG
 Window.softinput_mode = "below_target"
- 
+
 MODE_EDU = "EduConnect (identifiant EduConnect)"
 MODE_QR = "QR code Pronote"
 MODE_PWD = "Identifiant Pronote + mot de passe"
- 
- 
+
+
 # ---------- Icônes animées (dessinées en vecteur, pas de police) ----------
 class NavIcon(Widget):
     kind = StringProperty("home")
     p = NumericProperty(0)  # 0 = inactif, 1 = actif
- 
+
     def __init__(self, **kw):
         super().__init__(**kw)
         self.bind(pos=self.draw, size=self.draw, p=self.draw, kind=self.draw)
- 
+
     def draw(self, *_):
         self.canvas.clear()
         s = min(self.width, self.height) * 0.42 * (1 + 0.18 * self.p)
         cx, cy = self.center_x, self.center_y + dp(3) * self.p
         col = [GREY[i] + (ACCENT[i] - GREY[i]) * self.p for i in range(3)]
- 
+
         def P(pts):
             return [v for x, y in pts for v in (cx + x * s, cy + y * s)]
- 
+
         w = dp(1.8)
         with self.canvas:
             Color(*col, 1)
@@ -70,8 +70,8 @@ class NavIcon(Widget):
                 Line(points=P([(-0.9, 0.35), (0.9, 0.35)]), width=w)
                 Line(points=P([(-0.45, 0.7), (-0.45, 1.1)]), width=w, cap="round")
                 Line(points=P([(0.45, 0.7), (0.45, 1.1)]), width=w, cap="round")
- 
- 
+
+
 class NavTab(ButtonBehavior, BoxLayout):
     def __init__(self, kind, label, **kw):
         super().__init__(orientation="vertical", padding=(0, dp(6)), **kw)
@@ -79,12 +79,12 @@ class NavTab(ButtonBehavior, BoxLayout):
         self.lbl = Label(text=label, font_size=sp(11), color=GREY + (1,), size_hint_y=None, height=dp(16))
         self.add_widget(self.icon)
         self.add_widget(self.lbl)
- 
+
     def set_active(self, on):
         Animation(p=1 if on else 0, d=0.35, t="out_back").start(self.icon)
         Animation(color=(ACCENT if on else GREY) + (1,), d=0.25).start(self.lbl)
- 
- 
+
+
 # ---------- Cartes & écrans ----------
 class Card(BoxLayout):
     def __init__(self, title, sub="", right="", **kw):
@@ -102,8 +102,8 @@ class Card(BoxLayout):
         self.add_widget(left)
         self.add_widget(Label(text=right, font_size=sp(17), bold=True, color=ACCENT + (1,),
                               size_hint_x=None, width=dp(70)))
- 
- 
+
+
 class ListScreen(Screen):
     def __init__(self, title, **kw):
         super().__init__(**kw)
@@ -117,13 +117,13 @@ class ListScreen(Screen):
         sv.add_widget(self.box)
         self.root_box.add_widget(sv)
         self.add_widget(self.root_box)
- 
+
     def set_items(self, items):
         self.box.clear_widgets()
         for t, s, r in items or [("Rien à afficher", "", "")]:
             self.box.add_widget(Card(t, s, r))
- 
- 
+
+
 class HomeScreen(ListScreen):
     def __init__(self, title, **kw):
         super().__init__(title, **kw)
@@ -131,12 +131,12 @@ class HomeScreen(ListScreen):
                      background_color=CARD, color=GREY + (1,))
         btn.bind(on_release=lambda *_: App.get_running_app().logout())
         self.root_box.add_widget(btn)
- 
- 
+
+
 # ---------- App ----------
 class PronoteApp(App):
     NO_ENT = "Aucun ENT (connexion directe)"
- 
+
     # --- construction de l'interface ---
     def build(self):
         self.title = "Pronote"
@@ -144,14 +144,14 @@ class PronoteApp(App):
         self.root_sm.add_widget(self._login())
         self.root_sm.add_widget(self._main())
         return self.root_sm
- 
+
     def on_start(self):
         # Reconnexion automatique si on s'est déjà connecté par QR code
         creds = self._load_json("creds.json")
         if creds:
             self.status.text = "Reconnexion..."
             threading.Thread(target=self._work, args=("token", creds), daemon=True).start()
- 
+
     def _login(self):
         s = Screen(name="login")
         box = BoxLayout(orientation="vertical", padding=dp(28), spacing=dp(14))
@@ -185,7 +185,7 @@ class PronoteApp(App):
         s.add_widget(box)
         self._on_mode()
         return s
- 
+
     def _on_mode(self, *_):
         self.form.clear_widgets()
         if self.mode.text == MODE_QR:
@@ -196,7 +196,7 @@ class PronoteApp(App):
             widgets = (self.url, self.ent, self.user, self.pwd)
         for w in widgets:
             self.form.add_widget(w)
- 
+
     def _main(self):
         s = Screen(name="main")
         col = BoxLayout(orientation="vertical")
@@ -221,35 +221,35 @@ class PronoteApp(App):
         s.add_widget(col)
         self.tabs["home"].set_active(True)
         return s
- 
+
     def goto(self, key):
         self.sm.current = key
         for k, t in self.tabs.items():
             t.set_active(k == key)
- 
+
     # --- stockage local (jeton de reconnexion) ---
     def _path(self, name):
         return os.path.join(self.user_data_dir, name)
- 
+
     def _load_json(self, name):
         try:
             with open(self._path(name)) as f:
                 return json.load(f)
         except Exception:
             return None
- 
+
     def _save_json(self, name, data):
         os.makedirs(self.user_data_dir, exist_ok=True)
         with open(self._path(name), "w") as f:
             json.dump(data, f)
- 
+
     def _device_uuid(self):
         d = self._load_json("device.json")
         if not d:
             d = {"uuid": uuid.uuid4().hex}
             self._save_json("device.json", d)
         return d["uuid"]
- 
+
     def logout(self):
         try:
             os.remove(self._path("creds.json"))
@@ -257,7 +257,7 @@ class PronoteApp(App):
             pass
         self.status.text = ""
         self.root_sm.current = "login"
- 
+
     # --- connexion ---
     def _ent_list(self):
         # La liste des ENT vient directement de pronotepy (toujours à jour)
@@ -267,16 +267,27 @@ class PronoteApp(App):
         except Exception:
             names = []
         return [self.NO_ENT] + names
- 
+
     @staticmethod
     def _clean_url(url):
-        # Garde seulement .../pronote/eleve.html (enlève ?login=true, "mobile.", etc.)
-        url = url.split("?")[0].strip()
+        """Accepte n'importe quel lien donné par le lycée et en sort .../pronote/eleve.html"""
+        from urllib.parse import unquote, urlparse
+        url = "".join(url.strip().strip("\"'<>").split())  # espaces / retours à la ligne collés par erreur
+        if "service=" in url:  # lien EduConnect : https://.../cas/login?service=<lien Pronote>
+            url = unquote(url.split("service=", 1)[1].split("&")[0])
+        if "://" not in url:
+            url = "https://" + url
+        url = "https://" + url.split("://", 1)[1]
+        url = url.split("?")[0].split("#")[0]  # enlève ?login=true, etc.
         url = url.replace("mobile.eleve.html", "eleve.html").replace("mobile.parent.html", "parent.html")
         if "eleve.html" not in url and "parent.html" not in url:
-            url = url.rstrip("/") + "/eleve.html"
+            p = urlparse(url)
+            path = p.path.rstrip("/")
+            if not path:
+                path = "/pronote"
+            url = f"{p.scheme}://{p.netloc}{path}/eleve.html"
         return url
- 
+
     @staticmethod
     def _friendly(e):
         s = str(e)
@@ -296,7 +307,7 @@ class PronoteApp(App):
         if "Connection" in type(e).__name__ or "Max retries" in s:
             return "Pas de connexion internet, ou lien Pronote incorrect."
         return s[:220] or type(e).__name__
- 
+
     def connect(self, *_):
         self.status.text = "Connexion..."
         if self.mode.text == MODE_QR:
@@ -306,7 +317,7 @@ class PronoteApp(App):
             args = ("pwd", {"url": self._clean_url(self.url.text), "user": self.user.text.strip(),
                             "pwd": self.pwd.text, "ent": ent})
         threading.Thread(target=self._work, args=args, daemon=True).start()
- 
+
     def _work(self, kind, p):
         try:
             import pronotepy
@@ -323,6 +334,8 @@ class PronoteApp(App):
                 c = pronotepy.Client.token_login(**p)
             else:
                 import pronotepy.ent as ent_mod
+                if "parent.html" in p["url"]:
+                    raise Exception("Ce lien est celui d'un compte parent : l'app gère seulement les comptes élèves.")
                 if p["ent"] == "EDUCONNECT":
                     # Connexion EduConnect via le hub d'Index Education (fonction nommée "bordeaux" dans pronotepy)
                     ent = getattr(ent_mod, "bordeaux", None) or ent_mod.pronote_hubeduconnect(p["url"])
@@ -360,7 +373,7 @@ class PronoteApp(App):
                 except OSError:
                     pass
             Clock.schedule_once(lambda _: setattr(self.status, "text", msg))
- 
+
     def _done(self, data):
         name, grades, hw, edt = data
         self.status.text = ""
@@ -369,8 +382,7 @@ class PronoteApp(App):
         self.pages["homework"].set_items(hw)
         self.pages["edt"].set_items(edt)
         self.root_sm.current = "main"
- 
- 
+
+
 if __name__ == "__main__":
     PronoteApp().run()
-
