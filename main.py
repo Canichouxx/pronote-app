@@ -298,6 +298,9 @@ class PronoteApp(App):
             return "Identifiant ou mot de passe EduConnect incorrect."
         if "HubEduConnect" in s:
             return "Ton lycée n'est pas compatible avec cette connexion EduConnect. Utilise la méthode QR code."
+        if "Connection failure" in s:
+            return ("La connexion EduConnect automatique n'a pas abouti (ton lycée n'utilise sûrement pas ce chemin). "
+                    "Utilise la méthode QR code.")
         if "IP address is suspended" in s:
             return "Pronote a bloqué ton adresse IP un moment. Réessaie plus tard."
         if "MFA" in type(e).__name__:
@@ -373,6 +376,8 @@ class PronoteApp(App):
                 except OSError:
                     pass
             Clock.schedule_once(lambda _: setattr(self.status, "text", msg))
+            if kind == "pwd" and "méthode QR code" in msg:  # on bascule sur le QR code, c'est la solution
+                Clock.schedule_once(lambda _: setattr(self.mode, "text", MODE_QR))
 
     def _done(self, data):
         name, grades, hw, edt = data
