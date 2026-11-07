@@ -1,6 +1,10 @@
+import json
+import os
+import random
 import threading
+import uuid
 from datetime import date
-
+ 
 from kivy.animation import Animation
 from kivy.app import App
 from kivy.clock import Clock
@@ -17,33 +21,38 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
-
+ 
 BG = (0.05, 0.05, 0.07, 1)
 CARD = (0.10, 0.10, 0.14, 1)
 ACCENT = (0.47, 0.42, 1.0)
 GREY = (0.45, 0.45, 0.52)
 TEXT = (0.93, 0.93, 0.96, 1)
 Window.clearcolor = BG
-
-
+Window.softinput_mode = "below_target"
+ 
+MODE_EDU = "EduConnect (identifiant EduConnect)"
+MODE_QR = "QR code Pronote"
+MODE_PWD = "Identifiant Pronote + mot de passe"
+ 
+ 
 # ---------- Icônes animées (dessinées en vecteur, pas de police) ----------
 class NavIcon(Widget):
     kind = StringProperty("home")
     p = NumericProperty(0)  # 0 = inactif, 1 = actif
-
+ 
     def __init__(self, **kw):
         super().__init__(**kw)
         self.bind(pos=self.draw, size=self.draw, p=self.draw, kind=self.draw)
-
+ 
     def draw(self, *_):
         self.canvas.clear()
         s = min(self.width, self.height) * 0.42 * (1 + 0.18 * self.p)
         cx, cy = self.center_x, self.center_y + dp(3) * self.p
         col = [GREY[i] + (ACCENT[i] - GREY[i]) * self.p for i in range(3)]
-
+ 
         def P(pts):
             return [v for x, y in pts for v in (cx + x * s, cy + y * s)]
-
+ 
         w = dp(1.8)
         with self.canvas:
             Color(*col, 1)
@@ -61,8 +70,8 @@ class NavIcon(Widget):
                 Line(points=P([(-0.9, 0.35), (0.9, 0.35)]), width=w)
                 Line(points=P([(-0.45, 0.7), (-0.45, 1.1)]), width=w, cap="round")
                 Line(points=P([(0.45, 0.7), (0.45, 1.1)]), width=w, cap="round")
-
-
+ 
+ 
 class NavTab(ButtonBehavior, BoxLayout):
     def __init__(self, kind, label, **kw):
         super().__init__(orientation="vertical", padding=(0, dp(6)), **kw)
@@ -70,12 +79,12 @@ class NavTab(ButtonBehavior, BoxLayout):
         self.lbl = Label(text=label, font_size=sp(11), color=GREY + (1,), size_hint_y=None, height=dp(16))
         self.add_widget(self.icon)
         self.add_widget(self.lbl)
-
+ 
     def set_active(self, on):
         Animation(p=1 if on else 0, d=0.35, t="out_back").start(self.icon)
         Animation(color=(ACCENT if on else GREY) + (1,), d=0.25).start(self.lbl)
-
-
+ 
+ 
 # ---------- Cartes & écrans ----------
 class Card(BoxLayout):
     def __init__(self, title, sub="", right="", **kw):
@@ -93,63 +102,101 @@ class Card(BoxLayout):
         self.add_widget(left)
         self.add_widget(Label(text=right, font_size=sp(17), bold=True, color=ACCENT + (1,),
                               size_hint_x=None, width=dp(70)))
-
-
+ 
+ 
 class ListScreen(Screen):
     def __init__(self, title, **kw):
         super().__init__(**kw)
-        root = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
-        root.add_widget(Label(text=title, font_size=sp(26), bold=True, color=TEXT,
-                              size_hint_y=None, height=dp(48), halign="left",
-                              text_size=(Window.width - dp(32), None)))
+        self.root_box = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
+        self.root_box.add_widget(Label(text=title, font_size=sp(26), bold=True, color=TEXT,
+                                       size_hint_y=None, height=dp(48), halign="left",
+                                       text_size=(Window.width - dp(32), None)))
         sv = ScrollView()
         self.box = BoxLayout(orientation="vertical", spacing=dp(10), size_hint_y=None)
         self.box.bind(minimum_height=self.box.setter("height"))
         sv.add_widget(self.box)
-        root.add_widget(sv)
-        self.add_widget(root)
-
+        self.root_box.add_widget(sv)
+        self.add_widget(self.root_box)
+ 
     def set_items(self, items):
         self.box.clear_widgets()
         for t, s, r in items or [("Rien à afficher", "", "")]:
             self.box.add_widget(Card(t, s, r))
-
-
+ 
+ 
 class HomeScreen(ListScreen):
-    pass
-
-
+    def __init__(self, title, **kw):
+        super().__init__(title, **kw)
+        btn = Button(text="Se déconnecter", size_hint_y=None, height=dp(46), background_normal="",
+                     background_color=CARD, color=GREY + (1,))
+        btn.bind(on_release=lambda *_: App.get_running_app().logout())
+        self.root_box.add_widget(btn)
+ 
+ 
 # ---------- App ----------
 class PronoteApp(App):
+    NO_ENT = "Aucun ENT (connexion directe)"
+ 
+    # --- construction de l'interface ---
     def build(self):
         self.title = "Pronote"
         self.root_sm = ScreenManager(transition=FadeTransition(duration=0.2))
         self.root_sm.add_widget(self._login())
         self.root_sm.add_widget(self._main())
         return self.root_sm
-
+ 
+    def on_start(self):
+        # Reconnexion automatique si on s'est déjà connecté par QR code
+        creds = self._load_json("creds.json")
+        if creds:
+            self.status.text = "Reconnexion..."
+            threading.Thread(target=self._work, args=("token", creds), daemon=True).start()
+ 
     def _login(self):
         s = Screen(name="login")
         box = BoxLayout(orientation="vertical", padding=dp(28), spacing=dp(14))
-        box.add_widget(Label(text="Pronote", font_size=sp(36), bold=True, color=ACCENT + (1,)))
+        box.add_widget(Label(text="Pronote", font_size=sp(36), bold=True, color=ACCENT + (1,),
+                             size_hint_y=None, height=dp(90)))
         kw = dict(multiline=False, size_hint_y=None, height=dp(48), background_color=CARD,
                   foreground_color=TEXT, cursor_color=ACCENT + (1,), padding=(dp(14), dp(13)))
+        self.mode = Spinner(text=MODE_EDU, values=[MODE_EDU, MODE_QR, MODE_PWD], size_hint_y=None, height=dp(48),
+                            background_normal="", background_color=CARD, color=TEXT)
+        self.mode.bind(text=self._on_mode)
+        # Méthode QR code
+        self.qr = TextInput(hint_text="Colle ici le contenu du QR code", **dict(kw, multiline=True, height=dp(110)))
+        self.pin = TextInput(hint_text="Code à 4 chiffres choisi avec le QR code", input_filter="int", **kw)
+        # Méthode identifiant / mot de passe
         self.url = TextInput(hint_text="Lien Pronote du lycée", **kw)
-        self.ent = Spinner(text="Aucun ENT (connexion directe)", values=self._ent_list(),
-                           size_hint_y=None, height=dp(48), background_normal="",
-                           background_color=CARD, color=TEXT)
+        self.ent = Spinner(text=self.NO_ENT, values=self._ent_list(), size_hint_y=None, height=dp(48),
+                           background_normal="", background_color=CARD, color=TEXT)
         self.user = TextInput(hint_text="Identifiant", **kw)
         self.pwd = TextInput(hint_text="Mot de passe", password=True, **kw)
-        self.status = Label(text="", color=GREY + (1,), size_hint_y=None, height=dp(24), font_size=sp(12))
+        self.form = BoxLayout(orientation="vertical", spacing=dp(14), size_hint_y=None)
+        self.form.bind(minimum_height=self.form.setter("height"))
+        self.status = Label(text="", color=GREY + (1,), size_hint_y=None, height=dp(64), font_size=sp(12),
+                            halign="center", valign="middle")
+        self.status.bind(width=lambda i, w: setattr(i, "text_size", (w, None)))
         btn = Button(text="Se connecter", size_hint_y=None, height=dp(50), background_normal="",
                      background_color=ACCENT + (1,), bold=True)
         btn.bind(on_release=self.connect)
-        for w in (self.url, self.ent, self.user, self.pwd, self.status, btn):
+        for w in (self.mode, self.form, self.status, btn):
             box.add_widget(w)
         box.add_widget(Widget())
         s.add_widget(box)
+        self._on_mode()
         return s
-
+ 
+    def _on_mode(self, *_):
+        self.form.clear_widgets()
+        if self.mode.text == MODE_QR:
+            widgets = (self.qr, self.pin)
+        elif self.mode.text == MODE_EDU:
+            widgets = (self.url, self.user, self.pwd)
+        else:
+            widgets = (self.url, self.ent, self.user, self.pwd)
+        for w in widgets:
+            self.form.add_widget(w)
+ 
     def _main(self):
         s = Screen(name="main")
         col = BoxLayout(orientation="vertical")
@@ -174,14 +221,44 @@ class PronoteApp(App):
         s.add_widget(col)
         self.tabs["home"].set_active(True)
         return s
-
+ 
     def goto(self, key):
         self.sm.current = key
         for k, t in self.tabs.items():
             t.set_active(k == key)
-
-    NO_ENT = "Aucun ENT (connexion directe)"
-
+ 
+    # --- stockage local (jeton de reconnexion) ---
+    def _path(self, name):
+        return os.path.join(self.user_data_dir, name)
+ 
+    def _load_json(self, name):
+        try:
+            with open(self._path(name)) as f:
+                return json.load(f)
+        except Exception:
+            return None
+ 
+    def _save_json(self, name, data):
+        os.makedirs(self.user_data_dir, exist_ok=True)
+        with open(self._path(name), "w") as f:
+            json.dump(data, f)
+ 
+    def _device_uuid(self):
+        d = self._load_json("device.json")
+        if not d:
+            d = {"uuid": uuid.uuid4().hex}
+            self._save_json("device.json", d)
+        return d["uuid"]
+ 
+    def logout(self):
+        try:
+            os.remove(self._path("creds.json"))
+        except OSError:
+            pass
+        self.status.text = ""
+        self.root_sm.current = "login"
+ 
+    # --- connexion ---
     def _ent_list(self):
         # La liste des ENT vient directement de pronotepy (toujours à jour)
         try:
@@ -190,29 +267,82 @@ class PronoteApp(App):
         except Exception:
             names = []
         return [self.NO_ENT] + names
-
+ 
     @staticmethod
     def _clean_url(url):
-        # Garde seulement .../pronote/eleve.html (enlève ?login=true, etc.)
+        # Garde seulement .../pronote/eleve.html (enlève ?login=true, "mobile.", etc.)
         url = url.split("?")[0].strip()
         url = url.replace("mobile.eleve.html", "eleve.html").replace("mobile.parent.html", "parent.html")
         if "eleve.html" not in url and "parent.html" not in url:
             url = url.rstrip("/") + "/eleve.html"
         return url
-
+ 
+    @staticmethod
+    def _friendly(e):
+        s = str(e)
+        if "Page html is different" in s:
+            return ("Le lien ne mène pas à la page de connexion Pronote (ton lycée utilise sûrement "
+                    "EduConnect). Utilise la méthode QR code.")
+        if "probably wrong login information" in s:
+            return "Identifiant ou mot de passe EduConnect incorrect."
+        if "HubEduConnect" in s:
+            return "Ton lycée n'est pas compatible avec cette connexion EduConnect. Utilise la méthode QR code."
+        if "IP address is suspended" in s:
+            return "Pronote a bloqué ton adresse IP un moment. Réessaie plus tard."
+        if "MFA" in type(e).__name__:
+            return "Ton compte demande une double authentification (pas encore gérée)."
+        if "QR" in type(e).__name__ or "decrypt" in s.lower():
+            return "QR code ou code à 4 chiffres incorrect (ou QR code expiré). Génère-en un nouveau."
+        if "Connection" in type(e).__name__ or "Max retries" in s:
+            return "Pas de connexion internet, ou lien Pronote incorrect."
+        return s[:220] or type(e).__name__
+ 
     def connect(self, *_):
         self.status.text = "Connexion..."
-        threading.Thread(target=self._work, args=(self._clean_url(self.url.text), self.user.text.strip(),
-                                                  self.pwd.text, self.ent.text), daemon=True).start()
-
-    def _work(self, url, user, pwd, ent_name):
+        if self.mode.text == MODE_QR:
+            args = ("qr", {"qr": self.qr.text.strip(), "pin": self.pin.text.strip()})
+        else:
+            ent = "EDUCONNECT" if self.mode.text == MODE_EDU else self.ent.text
+            args = ("pwd", {"url": self._clean_url(self.url.text), "user": self.user.text.strip(),
+                            "pwd": self.pwd.text, "ent": ent})
+        threading.Thread(target=self._work, args=args, daemon=True).start()
+ 
+    def _work(self, kind, p):
         try:
             import pronotepy
-            import pronotepy.ent as ent_mod
-            ent = None if ent_name == self.NO_ENT else getattr(ent_mod, ent_name)
-            c = pronotepy.Client(url, username=user, password=pwd, ent=ent)
+            if kind == "qr":
+                try:
+                    qr = json.loads(p["qr"])
+                    qr["jeton"], qr["login"], qr["url"]
+                except Exception:
+                    raise Exception("Contenu du QR code invalide : colle tout le texte lu dans le QR code.")
+                if not (p["pin"].isdigit() and len(p["pin"]) == 4):
+                    raise Exception("Le code doit faire exactement 4 chiffres.")
+                c = pronotepy.Client.qrcode_login(qr, p["pin"], self._device_uuid())
+            elif kind == "token":
+                c = pronotepy.Client.token_login(**p)
+            else:
+                import pronotepy.ent as ent_mod
+                if p["ent"] == "EDUCONNECT":
+                    # Connexion EduConnect via le hub d'Index Education (fonction nommée "bordeaux" dans pronotepy)
+                    ent = getattr(ent_mod, "bordeaux", None) or ent_mod.pronote_hubeduconnect(p["url"])
+                else:
+                    ent = None if p["ent"] == self.NO_ENT else getattr(ent_mod, p["ent"])
+                c = pronotepy.Client(p["url"], username=p["user"], password=p["pwd"], ent=ent)
             if not c.logged_in:
                 raise Exception("Identifiants refusés")
+            if kind == "pwd":
+                # On échange la connexion contre un jeton : plus besoin de ressaisir (ni de stocker) le mot de passe
+                try:
+                    pin = "".join(random.choice("123456789") for _ in range(4))
+                    c = pronotepy.Client.qrcode_login(c.request_qr_code_data(pin), pin, self._device_uuid())
+                except Exception:
+                    pass
+            if kind in ("qr", "token", "pwd"):
+                try:
+                    self._save_json("creds.json", c.export_credentials())  # le jeton change à chaque connexion
+                except Exception:
+                    pass
             grades = [(g.subject.name, g.date.strftime("%d/%m"), f"{g.grade}/{g.out_of}")
                       for g in c.current_period.grades]
             hw = [(h.subject.name, h.description[:80], h.date.strftime("%d/%m"))
@@ -222,17 +352,25 @@ class PronoteApp(App):
             data = (c.info.name, grades, hw, edt)
             Clock.schedule_once(lambda _: self._done(data))
         except Exception as e:
-            msg = f"Erreur : {e}"[:80]
+            msg = self._friendly(e)
+            if kind == "token":
+                msg = "Session expirée, génère un nouveau QR code. (" + msg[:80] + ")"
+                try:
+                    os.remove(self._path("creds.json"))
+                except OSError:
+                    pass
             Clock.schedule_once(lambda _: setattr(self.status, "text", msg))
-
+ 
     def _done(self, data):
         name, grades, hw, edt = data
+        self.status.text = ""
         self.pages["home"].set_items([(f"Salut {name}", "Connecté à Pronote", "")])
         self.pages["grades"].set_items(grades)
         self.pages["homework"].set_items(hw)
         self.pages["edt"].set_items(edt)
         self.root_sm.current = "main"
-
-
+ 
+ 
 if __name__ == "__main__":
     PronoteApp().run()
+
