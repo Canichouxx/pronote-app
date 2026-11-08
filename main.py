@@ -145,7 +145,9 @@ class EduFlow:
         self.host = urlparse(url).netloc
         self.left = False
 
-    def update(self, current_url, cookie):
+    def update(self, current_url, cookie, hosts=()):
+        if any(h and h != self.host for h in hosts):  # historique : on est déjà passé par une autre page (EduConnect)
+            self.left = True
         host = urlparse(current_url or "").netloc
         if not host:
             return False
@@ -155,16 +157,30 @@ class EduFlow:
         return bool(self.left and cookie)
 
 
-def cookie_jar(cookie, url):
-    """Transforme 'a=1; b=2' (cookies de la fenêtre) en cookies utilisables par pronotepy."""
+def cookie_jar(cookies, url):
+    """Transforme les cookies de la fenêtre en cookies utilisables par pronotepy.
+    `cookies` : 'a=1; b=2' (pour le site Pronote) ou {adresse: 'a=1; b=2'} pour plusieurs sites (Pronote, hub EduConnect...)."""
     import requests
     jar = requests.cookies.RequestsCookieJar()
-    host = urlparse(url).netloc
-    for part in (cookie or "").split(";"):
-        if "=" in part:
-            k, v = part.strip().split("=", 1)
-            jar.set(k, v, domain=host, path="/")
+    if not isinstance(cookies, dict):
+        cookies = {url: cookies}
+    for site, cookie in cookies.items():
+        host = urlparse(site).netloc
+        for part in (cookie or "").split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                jar.set(k, v, domain=host, path="/")
     return jar
+
+
+def short_trail(hosts):
+    """Parcours résumé pour les messages d'erreur, ex. '0670020h > hubeduconnect > educonnect > 0670020h' (sans aucun cookie)."""
+    out = []
+    for h in hosts:
+        n = h.split(".")[0]
+        if not out or out[-1] != n:
+            out.append(n)
+    return " > ".join(out[:8])
 
 
 class EduPopup:
@@ -175,6 +191,8 @@ class EduPopup:
         self.url, self.on_done, self.on_error = url, on_done, on_error
         self.flow = EduFlow(url)
         self.cur_url, self.cookie = "", ""
+        self.hosts = [urlparse(url).netloc]  # sites visités pendant la connexion
+        self.cookies = {}  # {adresse: cookies}
         self.finished = False
         self._ev = None
         self._keep = []
@@ -186,7 +204,7 @@ class EduPopup:
     def open(self):
         try:
             self._ui(self._build)
-            self._ev = Clock.schedule_interval(self._poll, 0.8)
+            self._ev = Clock.schedule_interval(self._poll, 0.4)
         except Exception as e:
             self.on_error(str(e))
 
@@ -244,18 +262,34 @@ class EduPopup:
             msg = str(e)
             Clock.schedule_once(lambda _: self.on_error(msg))
 
+    DEFAULT_SITES = ("https://hubeduconnect.index-education.net/", "https://educonnect.education.gouv.fr/")
+
     def _read(self):  # thread d'interface
         try:
             self.cur_url = self.web.getUrl() or ""
-            self.cookie = self.cm.getCookie(self.url) or ""
+            self._see(self.cur_url)
+            try:  # historique de la fenêtre : attrape aussi les pages passées trop vite pour être vues
+                hist = self.web.copyBackForwardList()
+                for i in range(hist.getSize()):
+                    self._see(hist.getItemAtIndex(i).getUrl())
+            except Exception:
+                pass
+            sites = [self.url] + ["https://%s/" % h for h in self.hosts] + list(self.DEFAULT_SITES)
+            self.cookies = {u: self.cm.getCookie(u) or "" for u in dict.fromkeys(sites)}
+            self.cookie = self.cookies.get(self.url, "")
         except Exception:
             pass
+
+    def _see(self, url):
+        host = urlparse(url or "").netloc
+        if host and host not in self.hosts:
+            self.hosts.append(host)
 
     def _poll(self, dt):
         if self.finished:
             return False
         self._ui(self._read)
-        if self.flow.update(self.cur_url, self.cookie):
+        if self.flow.update(self.cur_url, self.cookie, self.hosts):
             self._finish()
             return False
 
@@ -274,9 +308,9 @@ class EduPopup:
         self.finished = True
         if self._ev:
             self._ev.cancel()
-        cookie = self.cookie
+        cookies = {u: c for u, c in self.cookies.items() if c}
         self._close()
-        self.on_done(self.url, cookie)
+        self.on_done(self.url, cookies, short_trail(self.hosts))
 
     def _close(self):
         def close():
@@ -500,12 +534,13 @@ class PronoteApp(App):
         if "annulée" not in msg:
             self.mode.text = MODE_QR
 
-    def _popup_done(self, url, cookie):
-        if not cookie:
-            self.status.text = "Aucune connexion détectée. Réessaie, ou utilise la méthode QR code."
+    def _popup_done(self, url, cookies, trail=""):
+        if not any(cookies.values() if isinstance(cookies, dict) else [cookies]):
+            self.status.text = "Aucune connexion détectée. Réessaie, ou utilise la méthode QR code. [%s]" % trail
             return
         self.status.text = "Connexion à Pronote..."
-        threading.Thread(target=self._work, args=("web", {"url": url, "cookie": cookie}), daemon=True).start()
+        threading.Thread(target=self._work, args=("web", {"url": url, "cookie": cookies, "trail": trail}),
+                         daemon=True).start()
 
     def connect(self, *_):
         if self.mode.text == MODE_WEB:
@@ -572,7 +607,8 @@ class PronoteApp(App):
         except Exception as e:
             msg = self._friendly(e)
             if kind == "web":
-                msg = "Pronote n'a pas reconnu la connexion de la fenêtre EduConnect. Utilise la méthode QR code."
+                msg = ("Pronote n'a pas reconnu la connexion de la fenêtre EduConnect. Utilise la méthode QR code. [%s]"
+                       % p.get("trail", ""))
             if kind == "token":
                 msg = "Session expirée, génère un nouveau QR code. (" + msg[:80] + ")"
                 try:
