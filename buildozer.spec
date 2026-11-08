@@ -5,7 +5,7 @@ package.domain = org.canichou
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 version = 0.1
-requirements = python3,kivy==2.3.0,pronotepy,autoslot,requests,urllib3,idna,certifi,charset-normalizer,pycryptodome,beautifulsoup4,soupsieve,typing_extensions,pytz
+requirements = python3,kivy==2.3.0,pyjnius,android,pronotepy,autoslot,requests,urllib3,idna,certifi,charset-normalizer,pycryptodome,beautifulsoup4,soupsieve,typing_extensions,pytz
 orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET
