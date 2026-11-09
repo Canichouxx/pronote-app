@@ -24,11 +24,35 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git zip unzip autoconf automake libtool libltdl-dev pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev build-essential ccache
 
+      - name: Clé de signature fixe (pour mettre à jour sans désinstaller)
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KS" ]; then echo "::error::Secret ANDROID_KEYSTORE_B64 manquant"; exit 1; fi
+          mkdir -p ~/.android
+          echo "$KS" | base64 -d > ~/.android/debug.keystore
+          keytool -list -keystore ~/.android/debug.keystore -storepass android 2>/dev/null | grep -i "fingerprint"
+
+      - name: Numéro de version qui augmente à chaque build
+        run: |
+          BUILD=${{ github.run_number }}
+          sed -i '/^version = /d; /^android.numeric_version/d' buildozer.spec
+          sed -i "/^\[app\]/a android.numeric_version = $((20000 + BUILD))" buildozer.spec
+          sed -i "/^\[app\]/a version = 0.1.$BUILD" buildozer.spec
+          grep -n -E "^(version|android.numeric_version)" buildozer.spec
+
       - name: Installer Buildozer
         run: pip install --upgrade buildozer "cython==0.29.36" virtualenv
 
       - name: Build APK
         run: buildozer -v android debug
+
+      - name: Signature de l'APK
+        run: |
+          AP=$(find ~/.buildozer -name apksigner -type f | head -1)
+          FP=$("$AP" verify --print-certs bin/*.apk | grep -i "SHA-256" | head -1)
+          echo "::notice title=Signature APK::$FP"
+          echo "::notice title=Version APK::0.1.${{ github.run_number }} (versionCode $((20000 + ${{ github.run_number }})))"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
