@@ -184,8 +184,10 @@ def short_trail(hosts):
 
 
 class EduPopup:
-    """Ouvre le lien Pronote du lycée dans une fenêtre : Pronote renvoie vers la VRAIE page EduConnect,
-    l'utilisateur s'y connecte lui-même (l'app ne voit jamais le mot de passe)."""
+    """Ouvre le lien Pronote du lycée dans une fenêtre Android : Pronote renvoie vers la VRAIE page EduConnect,
+    l'utilisateur s'y connecte lui-même (l'app ne voit jamais le mot de passe). Bouton Retour = fermer la fenêtre."""
+
+    DEFAULT_SITES = ("https://hubeduconnect.index-education.net/", "https://educonnect.education.gouv.fr/")
 
     def __init__(self, url, on_done, on_error):
         self.url, self.on_done, self.on_error = url, on_done, on_error
@@ -194,8 +196,11 @@ class EduPopup:
         self.hosts = [urlparse(url).netloc]  # sites visités pendant la connexion
         self.cookies = {}  # {adresse: cookies}
         self.finished = False
+        self.step = "début"  # étape en cours (pour dire où ça bloque en cas d'erreur)
+        self.web = self.cm = self.dlg = None
+        self.showing = self.was_showing = False
+        self.ticks = 0
         self._ev = None
-        self._keep = []
 
     def _ui(self, fn):
         from android.runnable import run_on_ui_thread
@@ -203,69 +208,59 @@ class EduPopup:
 
     def open(self):
         try:
+            self.step = "import android.runnable"
             self._ui(self._build)
             self._ev = Clock.schedule_interval(self._poll, 0.4)
         except Exception as e:
-            self.on_error(str(e))
+            self._fail("%s : %s : %s" % (self.step, type(e).__name__, str(e)[:100]))
+
+    def _fail(self, detail):
+        self.finished = True
+        if self._ev:
+            self._ev.cancel()
+        Clock.schedule_once(lambda _: self.on_error("ERR " + detail))
 
     def _build(self):  # exécuté sur le thread d'interface d'Android
         try:
-            from jnius import PythonJavaClass, autoclass, java_method
+            self.step = "import jnius"
+            from jnius import autoclass
+            self.step = "activité"
             act = autoclass("org.kivy.android.PythonActivity").mActivity
-            LinearLayout = autoclass("android.widget.LinearLayout")
-            LinearLP = autoclass("android.widget.LinearLayout$LayoutParams")
-            ViewLP = autoclass("android.view.ViewGroup$LayoutParams")
-            Button = autoclass("android.widget.Button")
-            WebView = autoclass("android.webkit.WebView")
-            WebViewClient = autoclass("android.webkit.WebViewClient")
-            cm = autoclass("android.webkit.CookieManager").getInstance()
-
-            class Click(PythonJavaClass):
-                __javainterfaces__ = ["android/view/View$OnClickListener"]
-                __javacontext__ = "app"
-
-                def __init__(self, cb):
-                    super().__init__()
-                    self.cb = cb
-
-                @java_method("(Landroid/view/View;)V")
-                def onClick(self, v):
-                    self.cb()
-
-            root = LinearLayout(act)
-            root.setOrientation(1)
-            root.setBackgroundColor(-15921902)  # fond sombre #0D0D12
-            bar = LinearLayout(act)
-            bar.setOrientation(0)
-            b_close, b_done = Button(act), Button(act)
-            b_close.setText("Fermer")
-            b_done.setText("J'ai terminé")
-            self._keep = [Click(self._on_close), Click(self._on_done_click)]
-            b_close.setOnClickListener(self._keep[0])
-            b_done.setOnClickListener(self._keep[1])
-            bar.addView(b_close, LinearLP(0, -2, 1.0))
-            bar.addView(b_done, LinearLP(0, -2, 1.0))
-            web = WebView(act)
+            self.step = "WebView"
+            web = autoclass("android.webkit.WebView")(act)
             st = web.getSettings()
             st.setJavaScriptEnabled(True)
             st.setDomStorageEnabled(True)
-            web.setWebViewClient(WebViewClient())  # reste dans la fenêtre pendant les redirections
+            web.setWebViewClient(autoclass("android.webkit.WebViewClient")())  # reste dans la fenêtre pendant les redirections
+            self.step = "cookies"
+            cm = autoclass("android.webkit.CookieManager").getInstance()
             cm.removeAllCookies(None)  # connexion « propre »
             cm.setAcceptCookie(True)
             cm.setAcceptThirdPartyCookies(web, True)
-            root.addView(bar, LinearLP(-1, -2))
-            root.addView(web, LinearLP(-1, 0, 1.0))
-            act.addContentView(root, ViewLP(-1, -1))
+            self.step = "fenêtre"
+            try:
+                theme = autoclass("android.R$style").Theme_Black_NoTitleBar_Fullscreen
+            except Exception:
+                theme = 16973832
+            dlg = autoclass("android.app.Dialog")(act, theme)
+            dlg.setContentView(web)
+            dlg.setCancelable(True)  # le bouton Retour ferme la fenêtre
+            self.step = "affichage"
+            dlg.show()
+            web.requestFocus()
+            self.step = "chargement"
             web.loadUrl(self.url)
-            self.root, self.web, self.cm = root, web, cm
+            self.web, self.cm, self.dlg = web, cm, dlg
+            self.step = "ok"
         except Exception as e:
-            msg = str(e)
-            Clock.schedule_once(lambda _: self.on_error(msg))
-
-    DEFAULT_SITES = ("https://hubeduconnect.index-education.net/", "https://educonnect.education.gouv.fr/")
+            self._fail("%s : %s : %s" % (self.step, type(e).__name__, str(e)[:100]))
 
     def _read(self):  # thread d'interface
         try:
+            if self.web is None:
+                return
+            self.showing = bool(self.dlg.isShowing())
+            self.was_showing = self.was_showing or self.showing
             self.cur_url = self.web.getUrl() or ""
             self._see(self.cur_url)
             try:  # historique de la fenêtre : attrape aussi les pages passées trop vite pour être vues
@@ -289,25 +284,29 @@ class EduPopup:
         if self.finished:
             return False
         self._ui(self._read)
-        if self.flow.update(self.cur_url, self.cookie, self.hosts):
+        self.ticks += 1
+        if self.flow.update(self.cur_url, self.cookie, self.hosts):  # retour sur Pronote après EduConnect
             self._finish()
             return False
+        if self.was_showing and not self.showing:  # fenêtre fermée avec le bouton Retour
+            if any(self.cookies.values()):
+                self._finish()  # on tente quand même (ex. connexion directe sans EduConnect)
+            else:
+                self._cancel()
+            return False
+        if self.web is not None and not self.was_showing and self.ticks > 25:  # ~10 s sans fenêtre visible
+            self._fail("la fenêtre ne s'affiche pas (étape : %s)" % self.step)
+            return False
 
-    def _on_close(self):  # clic sur « Fermer »
+    def _cancel(self):
         self.finished = True
         self._close()
         Clock.schedule_once(lambda _: self.on_error("Connexion annulée."))
-
-    def _on_done_click(self):  # clic sur « J'ai terminé » (au cas où la détection automatique ne se déclenche pas)
-        self._read()
-        Clock.schedule_once(lambda _: self._finish())
 
     def _finish(self):
         if self.finished:
             return
         self.finished = True
-        if self._ev:
-            self._ev.cancel()
         cookies = {u: c for u, c in self.cookies.items() if c}
         self._close()
         self.on_done(self.url, cookies, short_trail(self.hosts))
@@ -315,9 +314,10 @@ class EduPopup:
     def _close(self):
         def close():
             try:
-                from jnius import cast
-                cast("android.view.ViewGroup", self.root.getParent()).removeView(self.root)
-                self.web.destroy()
+                if self.dlg is not None and self.dlg.isShowing():
+                    self.dlg.dismiss()
+                if self.web is not None:
+                    self.web.destroy()
             except Exception:
                 pass
         if self._ev:
@@ -326,6 +326,17 @@ class EduPopup:
             self._ui(close)
         except Exception:
             pass
+
+
+def open_in_browser(url):
+    """Ouvre un lien dans le navigateur du téléphone (Chrome)."""
+    try:
+        from jnius import autoclass
+        Intent, Uri = autoclass("android.content.Intent"), autoclass("android.net.Uri")
+        autoclass("org.kivy.android.PythonActivity").mActivity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+    except Exception:
+        import webbrowser
+        webbrowser.open(url)
 
 
 # ---------- App ----------
@@ -381,6 +392,9 @@ class PronoteApp(App):
                      background_color=ACCENT + (1,), bold=True)
         btn.bind(on_release=self.connect)
         self.btn = btn
+        self.btn_open = Button(text="1. Ouvrir Pronote dans Chrome (EduConnect)", size_hint_y=None, height=dp(44),
+                               background_normal="", background_color=CARD, color=TEXT)
+        self.btn_open.bind(on_release=lambda *_: open_in_browser(self._clean_url(self.url.text)))
         for w in (self.mode, self.form, self.status, btn):
             box.add_widget(w)
         box.add_widget(Widget())
@@ -394,7 +408,7 @@ class PronoteApp(App):
         if self.mode.text == MODE_WEB:
             widgets = (self.url, self.hint)
         elif self.mode.text == MODE_QR:
-            widgets = (self.qr, self.pin)
+            widgets = (self.url, self.btn_open, self.qr, self.pin)
         elif self.mode.text == MODE_EDU:
             widgets = (self.url, self.user, self.pwd)
         else:
@@ -529,10 +543,11 @@ class PronoteApp(App):
             self._popup_error(str(e))
 
     def _popup_error(self, msg):
-        self.status.text = ("Connexion annulée." if "annulée" in msg else
-                            "La fenêtre EduConnect n'a pas pu s'ouvrir. Utilise la méthode QR code.")
-        if "annulée" not in msg:
-            self.mode.text = MODE_QR
+        if "annulée" in msg:
+            self.status.text = "Connexion annulée."
+            return
+        self.status.text = "La fenêtre EduConnect n'a pas pu s'ouvrir. Utilise la méthode QR code. [%s]" % msg.replace("ERR ", "")[:170]
+        self.mode.text = MODE_QR
 
     def _popup_done(self, url, cookies, trail=""):
         if not any(cookies.values() if isinstance(cookies, dict) else [cookies]):
