@@ -1,14 +1,19 @@
 import json
 import os
 import random
+import sys
 import threading
+import time
+import traceback
 import uuid
 from datetime import date
 from urllib.parse import urlparse
 
 from kivy.animation import Animation
 from kivy.app import App
+from kivy.base import ExceptionHandler, ExceptionManager
 from kivy.clock import Clock
+from kivy.core.clipboard import Clipboard
 from kivy.core.window import Window
 from kivy.graphics import Color, Line, RoundedRectangle
 from kivy.metrics import dp, sp
@@ -16,7 +21,9 @@ from kivy.properties import NumericProperty, StringProperty
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
+from kivy.uix.checkbox import CheckBox
 from kivy.uix.label import Label
+from kivy.uix.popup import Popup
 from kivy.uix.screenmanager import FadeTransition, Screen, ScreenManager
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
@@ -32,6 +39,54 @@ TEXT = (0.93, 0.93, 0.96, 1)
 Window.clearcolor = BG
 Window.softinput_mode = "below_target"
 WEB_OK = platform == "android" or bool(os.environ.get("PRONOTE_TEST_WEB"))  # fenêtre de connexion : Android seulement
+
+
+# ---------- Journal (pour comprendre ce qui ne marche pas) ----------
+APP_VERSION = "journal-1"
+LOG_LINES = []  # dernières lignes du journal, gardées en mémoire
+SECRETS = set()  # mots de passe, identifiants, jetons : remplacés par *** dans le journal
+
+
+def scrub(text):
+    text = str(text)
+    for secret in sorted(SECRETS, key=len, reverse=True):
+        if secret and len(secret) >= 3:
+            text = text.replace(secret, "***")
+    return text
+
+
+def log(msg, *args):
+    """Ajoute une ligne au journal (jamais de mot de passe, identifiant ou jeton : ils sont remplacés par ***)."""
+    try:
+        line = time.strftime("%H:%M:%S ") + scrub(msg % args if args else msg)
+    except Exception:
+        line = time.strftime("%H:%M:%S ") + scrub(msg)
+    LOG_LINES.append(line)
+    del LOG_LINES[:-400]
+    try:
+        app = App.get_running_app()
+        if app:
+            os.makedirs(app.user_data_dir, exist_ok=True)
+            with open(os.path.join(app.user_data_dir, "app.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _hook(exc_type, exc, tb):
+    log("ERREUR NON GÉRÉE : %s : %s | %s", getattr(exc_type, "__name__", exc_type), exc,
+        " > ".join("%s:%s" % (os.path.basename(f.filename), f.lineno) for f in traceback.extract_tb(tb)[-4:]))
+
+
+class _KivyErrors(ExceptionHandler):
+    def handle_exception(self, inst):
+        _hook(type(inst), inst, inst.__traceback__)
+        return ExceptionManager.PASS
+
+
+sys.excepthook = _hook
+threading.excepthook = lambda a: _hook(a.exc_type, a.exc_value, a.exc_traceback)
+ExceptionManager.add_handler(_KivyErrors())
 
 MODE_WEB = "EduConnect (fenêtre de connexion)"
 MODE_EDU = "EduConnect (identifiant EduConnect)"
@@ -135,6 +190,10 @@ class HomeScreen(ListScreen):
                      background_color=CARD, color=GREY + (1,))
         btn.bind(on_release=lambda *_: App.get_running_app().logout())
         self.root_box.add_widget(btn)
+        jb = Button(text="Journal (aide au dépannage)", size_hint_y=None, height=dp(40), background_normal="",
+                    background_color=BG, color=GREY + (1,), font_size=sp(12))
+        jb.bind(on_release=lambda *_: App.get_running_app().show_log())
+        self.root_box.add_widget(jb)
 
 
 # ---------- Fenêtre de connexion EduConnect (WebView Android) ----------
@@ -196,11 +255,15 @@ class EduPopup:
         self.hosts = [urlparse(url).netloc]  # sites visités pendant la connexion
         self.cookies = {}  # {adresse: cookies}
         self.finished = False
-        self.step = "début"  # étape en cours (pour dire où ça bloque en cas d'erreur)
+        self._step("début")  # étape en cours (pour dire où ça bloque en cas d'erreur)
         self.web = self.cm = self.dlg = None
         self.showing = self.was_showing = False
         self.ticks = 0
         self._ev = None
+
+    def _step(self, name):
+        self.step = name
+        log("fenêtre : étape %s", name)
 
     def _ui(self, fn):
         from android.runnable import run_on_ui_thread
@@ -208,13 +271,14 @@ class EduPopup:
 
     def open(self):
         try:
-            self.step = "import android.runnable"
+            self._step("import android.runnable")
             self._ui(self._build)
             self._ev = Clock.schedule_interval(self._poll, 0.4)
         except Exception as e:
             self._fail("%s : %s : %s" % (self.step, type(e).__name__, str(e)[:100]))
 
     def _fail(self, detail):
+        log("fenêtre : ÉCHEC %s", detail)
         self.finished = True
         if self._ev:
             self._ev.cancel()
@@ -222,22 +286,22 @@ class EduPopup:
 
     def _build(self):  # exécuté sur le thread d'interface d'Android
         try:
-            self.step = "import jnius"
+            self._step("import jnius")
             from jnius import autoclass
-            self.step = "activité"
+            self._step("activité")
             act = autoclass("org.kivy.android.PythonActivity").mActivity
-            self.step = "WebView"
+            self._step("WebView")
             web = autoclass("android.webkit.WebView")(act)
             st = web.getSettings()
             st.setJavaScriptEnabled(True)
             st.setDomStorageEnabled(True)
             web.setWebViewClient(autoclass("android.webkit.WebViewClient")())  # reste dans la fenêtre pendant les redirections
-            self.step = "cookies"
+            self._step("cookies")
             cm = autoclass("android.webkit.CookieManager").getInstance()
             cm.removeAllCookies(None)  # connexion « propre »
             cm.setAcceptCookie(True)
             cm.setAcceptThirdPartyCookies(web, True)
-            self.step = "fenêtre"
+            self._step("fenêtre")
             try:
                 theme = autoclass("android.R$style").Theme_Black_NoTitleBar_Fullscreen
             except Exception:
@@ -245,13 +309,13 @@ class EduPopup:
             dlg = autoclass("android.app.Dialog")(act, theme)
             dlg.setContentView(web)
             dlg.setCancelable(True)  # le bouton Retour ferme la fenêtre
-            self.step = "affichage"
+            self._step("affichage")
             dlg.show()
             web.requestFocus()
-            self.step = "chargement"
+            self._step("chargement")
             web.loadUrl(self.url)
             self.web, self.cm, self.dlg = web, cm, dlg
-            self.step = "ok"
+            self._step("ok")
         except Exception as e:
             self._fail("%s : %s : %s" % (self.step, type(e).__name__, str(e)[:100]))
 
@@ -279,6 +343,7 @@ class EduPopup:
         host = urlparse(url or "").netloc
         if host and host not in self.hosts:
             self.hosts.append(host)
+            log("fenêtre : nouvelle page visitée (%s)", host)
 
     def _poll(self, dt):
         if self.finished:
@@ -299,6 +364,7 @@ class EduPopup:
             return False
 
     def _cancel(self):
+        log("fenêtre : fermée sans connexion")
         self.finished = True
         self._close()
         Clock.schedule_once(lambda _: self.on_error("Connexion annulée."))
@@ -308,6 +374,10 @@ class EduPopup:
             return
         self.finished = True
         cookies = {u: c for u, c in self.cookies.items() if c}
+        for c in cookies.values():  # valeurs des cookies : jamais dans le journal
+            SECRETS.update(p.partition("=")[2].strip() for p in c.split(";"))
+        log("fenêtre : terminée, parcours = %s, sites avec cookies = %d, retour sur Pronote = %s",
+            short_trail(self.hosts), len(cookies), self.flow.left)
         self._close()
         self.on_done(self.url, cookies, short_trail(self.hosts))
 
@@ -347,21 +417,106 @@ class PronoteApp(App):
     # --- construction de l'interface ---
     def build(self):
         self.title = "Pronote"
+        self._auto_tried = False
+        self._saved = self._load_json("saved.json")  # {"mode","url","user","pwd","ent","auto"}
+        if self._saved:
+            SECRETS.update([self._saved.get("user", ""), self._saved.get("pwd", "")])
         self.root_sm = ScreenManager(transition=FadeTransition(duration=0.2))
         self.root_sm.add_widget(self._login())
         self.root_sm.add_widget(self._main())
         return self.root_sm
 
     def on_start(self):
-        # Reconnexion automatique si on s'est déjà connecté par QR code
+        import kivy
+        try:
+            os.makedirs(self.user_data_dir, exist_ok=True)
+            if os.path.getsize(self._path("app.log")) > 200_000:  # journal trop gros : on repart de zéro
+                os.remove(self._path("app.log"))
+        except OSError:
+            pass
+        log("=== démarrage : appli %s | Python %s | Kivy %s | plateforme %s", APP_VERSION, sys.version.split()[0],
+            kivy.__version__, platform)
+        try:
+            from importlib.metadata import version
+            log("pronotepy %s", version("pronotepy"))
+        except Exception as e:
+            log("pronotepy : version inconnue (%s)", type(e).__name__)
+        for mod in ("pronotepy", "autoslot", "bs4", "Crypto", "requests", "jnius", "android"):
+            try:
+                __import__(mod)
+                log("module %s : ok", mod)
+            except Exception as e:
+                log("module %s : MANQUANT (%s)", mod, type(e).__name__)
+        log("modes disponibles : %s | ENT connus : %d | identifiants enregistrés : %s | jeton enregistré : %s",
+            list(self.mode.values), len(self.ent.values) - 1, bool(self._saved), bool(self._load_json("creds.json")))
+        # Reconnexion automatique : d'abord par jeton (QR code / connexion précédente), sinon avec les identifiants enregistrés
         creds = self._load_json("creds.json")
         if creds:
             self.status.text = "Reconnexion..."
             threading.Thread(target=self._work, args=("token", creds), daemon=True).start()
+        else:
+            self._auto_pwd()
+
+    def _auto_pwd(self):
+        """Connexion automatique avec les identifiants enregistrés (une seule tentative par lancement)."""
+        sv = self._saved
+        if not sv or not sv.get("auto") or self._auto_tried or sv.get("mode") == MODE_WEB:
+            return
+        self._auto_tried = True
+        log("connexion automatique avec les identifiants enregistrés (mode : %s)", sv.get("mode"))
+        self.status.text = "Connexion avec tes identifiants enregistrés..."
+        payload = {k: sv.get(k, "") for k in ("url", "user", "pwd", "ent", "mode")}
+        payload["ent"] = "EDUCONNECT" if sv.get("mode") == MODE_EDU else sv.get("ent", self.NO_ENT)
+        payload["remember"] = True
+        threading.Thread(target=self._work, args=("pwd", payload), daemon=True).start()
+
+    def forget_saved(self, *_):
+        try:
+            os.remove(self._path("saved.json"))
+        except OSError:
+            pass
+        self._saved = None
+        self.user.text = self.pwd.text = ""
+        self.status.text = "Identifiants enregistrés effacés."
+        log("identifiants enregistrés effacés")
+        self._on_mode()
+
+    def show_log(self, *_):
+        text = "\n".join(LOG_LINES[-150:]) or "(journal vide)"
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        sv = ScrollView()
+        lab = Label(text=text, font_size=sp(10), color=TEXT, halign="left", valign="top", size_hint_y=None)
+        lab.bind(width=lambda i, w: setattr(i, "text_size", (w, None)))
+        lab.bind(texture_size=lambda i, ts: setattr(i, "height", ts[1]))
+        sv.add_widget(lab)
+        box.add_widget(sv)
+        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        full = lambda: ("Journal Pronote app - version %s\n" % APP_VERSION) + "\n".join(LOG_LINES)
+        bcopy = Button(text="Copier le journal", background_normal="", background_color=ACCENT + (1,), bold=True)
+        bclear = Button(text="Effacer", background_normal="", background_color=CARD, color=TEXT)
+        bclose = Button(text="Fermer", background_normal="", background_color=CARD, color=TEXT)
+        pop = Popup(title="Journal (copie-le et envoie-le moi)", content=box, size_hint=(0.97, 0.92))
+
+        def do_copy(*_):
+            Clipboard.copy(full())
+            bcopy.text = "Copié ✓"
+
+        def do_clear(*_):
+            del LOG_LINES[:]
+            lab.text = "(journal vide)"
+
+        bcopy.bind(on_release=do_copy)
+        bclear.bind(on_release=do_clear)
+        bclose.bind(on_release=pop.dismiss)
+        for b in (bcopy, bclear, bclose):
+            row.add_widget(b)
+        box.add_widget(row)
+        pop.open()
 
     def _login(self):
         s = Screen(name="login")
-        box = BoxLayout(orientation="vertical", padding=dp(28), spacing=dp(14))
+        box = BoxLayout(orientation="vertical", padding=dp(28), spacing=dp(14), size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
         box.add_widget(Label(text="Pronote", font_size=sp(36), bold=True, color=ACCENT + (1,),
                              size_hint_y=None, height=dp(90)))
         kw = dict(multiline=False, size_hint_y=None, height=dp(48), background_color=CARD,
@@ -395,10 +550,31 @@ class PronoteApp(App):
         self.btn_open = Button(text="1. Ouvrir Pronote dans Chrome (EduConnect)", size_hint_y=None, height=dp(44),
                                background_normal="", background_color=CARD, color=TEXT)
         self.btn_open.bind(on_release=lambda *_: open_in_browser(self._clean_url(self.url.text)))
-        for w in (self.mode, self.form, self.status, btn):
+        # « Se souvenir de mes identifiants » (enregistrés seulement sur ce téléphone, jamais envoyés ailleurs)
+        self.remember = CheckBox(active=True, size_hint_x=None, width=dp(40))
+        self.remember_row = BoxLayout(size_hint_y=None, height=dp(36))
+        self.remember_row.add_widget(self.remember)
+        rl = Label(text="Se souvenir de mes identifiants", color=GREY + (1,), font_size=sp(13), halign="left", valign="middle")
+        rl.bind(size=lambda i, v: setattr(i, "text_size", v))
+        self.remember_row.add_widget(rl)
+        self.btn_forget = Button(text="Oublier mes identifiants enregistrés", size_hint_y=None, height=dp(36),
+                                 background_normal="", background_color=CARD, color=GREY + (1,), font_size=sp(12))
+        self.btn_forget.bind(on_release=self.forget_saved)
+        jb = Button(text="Journal (aide au dépannage)", size_hint_y=None, height=dp(36), background_normal="",
+                    background_color=BG, color=GREY + (1,), font_size=sp(12))
+        jb.bind(on_release=self.show_log)
+        for w in (self.mode, self.form, self.status, btn, jb):
             box.add_widget(w)
-        box.add_widget(Widget())
-        s.add_widget(box)
+        sv = ScrollView(do_scroll_x=False)
+        sv.add_widget(box)
+        s.add_widget(sv)
+        sv_ = self._saved or {}  # on remplit les champs avec les identifiants enregistrés
+        if sv_:
+            self.url.text, self.user.text, self.pwd.text = sv_.get("url", ""), sv_.get("user", ""), sv_.get("pwd", "")
+            if sv_.get("ent") in self.ent.values:
+                self.ent.text = sv_["ent"]
+            if sv_.get("mode") in self.mode.values:
+                self.mode.text = sv_["mode"]
         self._on_mode()
         return s
 
@@ -410,9 +586,12 @@ class PronoteApp(App):
         elif self.mode.text == MODE_QR:
             widgets = (self.url, self.btn_open, self.qr, self.pin)
         elif self.mode.text == MODE_EDU:
-            widgets = (self.url, self.user, self.pwd)
+            widgets = (self.url, self.user, self.pwd, self.remember_row)
         else:
-            widgets = (self.url, self.ent, self.user, self.pwd)
+            widgets = (self.url, self.ent, self.user, self.pwd, self.remember_row)
+        if self._saved and self.mode.text in (MODE_EDU, MODE_PWD):
+            widgets = widgets + (self.btn_forget,)
+        log("mode choisi : %s", self.mode.text)
         for w in widgets:
             self.form.add_widget(w)
 
@@ -470,10 +649,14 @@ class PronoteApp(App):
         return d["uuid"]
 
     def logout(self):
+        log("déconnexion")
         try:
             os.remove(self._path("creds.json"))
         except OSError:
             pass
+        if self._saved:  # on garde les identifiants pour pré-remplir, mais plus de reconnexion automatique
+            self._saved["auto"] = False
+            self._save_json("saved.json", self._saved)
         self.status.text = ""
         self.root_sm.current = "login"
 
@@ -536,6 +719,7 @@ class PronoteApp(App):
             self.status.text = "Ce lien est celui d'un compte parent : l'app gère seulement les comptes élèves."
             return
         self.status.text = "Ouverture de la fenêtre EduConnect..."
+        log("ouverture de la fenêtre EduConnect (hôte : %s)", urlparse(url).netloc)
         try:
             self.popup = self.POPUP_CLS(url, self._popup_done, self._popup_error)
             self.popup.open()
@@ -543,6 +727,7 @@ class PronoteApp(App):
             self._popup_error(str(e))
 
     def _popup_error(self, msg):
+        log("fenêtre EduConnect : erreur (%s)", msg[:200])
         if "annulée" in msg:
             self.status.text = "Connexion annulée."
             return
@@ -558,18 +743,22 @@ class PronoteApp(App):
                          daemon=True).start()
 
     def connect(self, *_):
+        log("bouton « connecter » (mode : %s, hôte : %s)", self.mode.text, urlparse(self._clean_url(self.url.text)).netloc or "-")
         if self.mode.text == MODE_WEB:
             return self.open_popup()
         self.status.text = "Connexion..."
+        SECRETS.update([self.user.text.strip(), self.pwd.text])
         if self.mode.text == MODE_QR:
             args = ("qr", {"qr": self.qr.text.strip(), "pin": self.pin.text.strip()})
         else:
             ent = "EDUCONNECT" if self.mode.text == MODE_EDU else self.ent.text
             args = ("pwd", {"url": self._clean_url(self.url.text), "user": self.user.text.strip(),
-                            "pwd": self.pwd.text, "ent": ent})
+                            "pwd": self.pwd.text, "ent": ent, "mode": self.mode.text,
+                            "remember": self.remember.active})
         threading.Thread(target=self._work, args=args, daemon=True).start()
 
     def _work(self, kind, p):
+        log("connexion : début (type : %s)", kind)
         try:
             import pronotepy
             if kind == "qr":
@@ -618,8 +807,13 @@ class PronoteApp(App):
             edt = [(l.subject.name if l.subject else "Cours", l.room or "", l.start.strftime("%H:%M"))
                    for l in c.lessons(date.today())]
             data = (c.info.name, grades, hw, edt)
+            log("connexion : RÉUSSIE (type : %s) | notes : %d, devoirs : %d, cours : %d", kind, len(grades), len(hw), len(edt))
+            if kind == "pwd":
+                self._remember_creds(p)
             Clock.schedule_once(lambda _: self._done(data))
         except Exception as e:
+            frames = " > ".join("%s:%s" % (os.path.basename(f.filename), f.lineno) for f in traceback.extract_tb(e.__traceback__)[-4:])
+            log("connexion : ÉCHEC (type : %s) | %s : %s | %s", kind, type(e).__name__, str(e)[:200], frames)
             msg = self._friendly(e)
             if kind == "web":
                 msg = ("Pronote n'a pas reconnu la connexion de la fenêtre EduConnect. Utilise la méthode QR code. [%s]"
@@ -630,9 +824,36 @@ class PronoteApp(App):
                     os.remove(self._path("creds.json"))
                 except OSError:
                     pass
+                Clock.schedule_once(lambda _: self._auto_pwd())  # le jeton ne marche plus : on essaie les identifiants enregistrés
             Clock.schedule_once(lambda _: setattr(self.status, "text", msg))
             if kind in ("pwd", "web") and "méthode QR code" in msg:  # on bascule sur le QR code, c'est la solution
                 Clock.schedule_once(lambda _: setattr(self.mode, "text", MODE_QR))
+
+    def _remember_creds(self, p):
+        """Enregistre (ou efface) les identifiants sur le téléphone, selon la case « Se souvenir »."""
+        try:
+            if p.get("remember"):
+                self._saved = {"mode": p.get("mode", MODE_EDU), "url": p["url"], "user": p["user"], "pwd": p["pwd"],
+                               "ent": p.get("ent", ""), "auto": True}
+                if self._saved["ent"] == "EDUCONNECT":
+                    self._saved["ent"] = self.NO_ENT
+                self._save_json("saved.json", self._saved)
+                try:
+                    os.chmod(self._path("saved.json"), 0o600)  # lisible seulement par l'appli
+                except OSError:
+                    pass
+                log("identifiants enregistrés sur ce téléphone")
+            else:
+                self.forget_saved_silent()
+        except Exception as e:
+            log("enregistrement des identifiants impossible : %s", type(e).__name__)
+
+    def forget_saved_silent(self):
+        try:
+            os.remove(self._path("saved.json"))
+        except OSError:
+            pass
+        self._saved = None
 
     def _done(self, data):
         name, grades, hw, edt = data
