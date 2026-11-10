@@ -47,15 +47,19 @@ jobs:
       - name: Build APK
         run: buildozer -v android debug
 
-      - name: Signature de l'APK
+      - name: Signer l'APK avec la clé fixe
         run: |
           AP=$(find ~/.buildozer -name apksigner -type f | head -1)
-          FP=$("$AP" verify --print-certs bin/*.apk | grep -i "SHA-256" | head -1)
-          echo "::notice title=Signature APK::$FP"
+          SRC=$(ls bin/*.apk | head -1)
+          "$AP" sign --ks ~/.android/debug.keystore --ks-pass pass:android --key-pass pass:android --ks-key-alias androiddebugkey --out bin/pronote.apk "$SRC"
+          GOT=$("$AP" verify --print-certs bin/pronote.apk | grep -i "SHA-256 digest" | head -1 | sed 's/.*: *//' | tr -d ' ')
+          WANT=$(keytool -list -v -keystore ~/.android/debug.keystore -storepass android 2>/dev/null | grep "SHA256:" | head -1 | sed 's/.*SHA256: *//' | tr -d ': ' | tr 'A-F' 'a-f')
+          echo "::notice title=Signature APK::$GOT"
           echo "::notice title=Version APK::0.1.${{ github.run_number }} (versionCode $((20000 + ${{ github.run_number }})))"
+          if [ "$GOT" != "$WANT" ]; then echo "::error::La signature ne correspond pas à la clé fixe ($GOT / $WANT)"; exit 1; fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: pronote-apk
-          path: bin/*.apk
+          path: bin/pronote.apk
