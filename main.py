@@ -6,8 +6,8 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import date
-from urllib.parse import urlparse
+from datetime import date, datetime, timedelta
+from urllib.parse import parse_qs, unquote, urlparse
 
 from kivy.animation import Animation
 from kivy.app import App
@@ -15,36 +15,31 @@ from kivy.base import ExceptionHandler, ExceptionManager
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.core.window import Window
-from kivy.graphics import Color, Line, RoundedRectangle
+from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle
 from kivy.metrics import dp, sp
 from kivy.properties import NumericProperty, StringProperty
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
-from kivy.uix.checkbox import CheckBox
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
-from kivy.uix.screenmanager import FadeTransition, Screen, ScreenManager
+from kivy.uix.screenmanager import FadeTransition, NoTransition, Screen, ScreenManager
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy.utils import platform
 
-BG = (0.05, 0.05, 0.07, 1)
-CARD = (0.10, 0.10, 0.14, 1)
-ACCENT = (0.47, 0.42, 1.0)
-GREY = (0.45, 0.45, 0.52)
-TEXT = (0.93, 0.93, 0.96, 1)
-Window.clearcolor = BG
+APP_VERSION = "bulles-1"
+WEB_OK = platform == "android" or bool(os.environ.get("PRONOTE_TEST_WEB"))  # fenêtre EduConnect : Android seulement
 Window.softinput_mode = "below_target"
-WEB_OK = platform == "android" or bool(os.environ.get("PRONOTE_TEST_WEB"))  # fenêtre de connexion : Android seulement
 
 
-# ---------- Journal (pour comprendre ce qui ne marche pas) ----------
-APP_VERSION = "journal-1"
-LOG_LINES = []  # dernières lignes du journal, gardées en mémoire
-SECRETS = set()  # mots de passe, identifiants, jetons : remplacés par *** dans le journal
+# =====================================================================================
+#  Journal (pour comprendre ce qui ne marche pas) : jamais de mot de passe, jeton ni cookie
+# =====================================================================================
+LOG_LINES = []
+SECRETS = set()
 
 
 def scrub(text):
@@ -56,7 +51,6 @@ def scrub(text):
 
 
 def log(msg, *args):
-    """Ajoute une ligne au journal (jamais de mot de passe, identifiant ou jeton : ils sont remplacés par ***)."""
     try:
         line = time.strftime("%H:%M:%S ") + scrub(msg % args if args else msg)
     except Exception:
@@ -88,13 +82,458 @@ sys.excepthook = _hook
 threading.excepthook = lambda a: _hook(a.exc_type, a.exc_value, a.exc_traceback)
 ExceptionManager.add_handler(_KivyErrors())
 
-MODE_WEB = "EduConnect (fenêtre de connexion)"
-MODE_EDU = "EduConnect (identifiant EduConnect)"
-MODE_QR = "QR code Pronote"
-MODE_PWD = "Identifiant Pronote + mot de passe"
+
+# =====================================================================================
+#  Statistiques (fonctions simples, sans interface : faciles à tester)
+# =====================================================================================
+def num(x):
+    """'15,5' -> 15.5 ; 'Absent', 'Disp', '' ou None -> None"""
+    try:
+        return float(str(x).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return None
 
 
-# ---------- Icônes animées (dessinées en vecteur, pas de police) ----------
+def norm20(value, out_of="20"):
+    v, o = num(value), num(out_of)
+    if v is None or not o or o <= 0:
+        return None
+    return v / o * 20
+
+
+def fmt(x, nd=1):
+    return "—" if x is None else ("%.*f" % (nd, x)).replace(".", ",")
+
+
+# (note minimale, libellé, couleur) : palette adaptée au daltonisme, et le libellé écrit accompagne toujours la couleur
+LEVELS = [
+    (16, "Excellent", (0.34, 0.71, 0.91)),
+    (14, "Très bien", (0.00, 0.62, 0.45)),
+    (12, "Bien", (0.94, 0.89, 0.26)),
+    (10, "Correct", (0.90, 0.62, 0.00)),
+    (8, "Fragile", (0.84, 0.37, 0.00)),
+    (-1, "À revoir", (0.80, 0.47, 0.65)),
+]
+
+
+def level(v):
+    if v is None:
+        return "Sans note", (0.5, 0.5, 0.55)
+    for lo, label, col in LEVELS:
+        if v >= lo:
+            return label, col
+    return LEVELS[-1][1], LEVELS[-1][2]
+
+
+def _lum(c):
+    f = lambda u: u / 12.92 if u <= 0.03928 else ((u + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
+
+
+def best_text(rgb):
+    """Noir ou blanc : celui qui est le plus lisible (contraste le plus élevé) sur cette couleur."""
+    l = _lum(rgb)
+    return (0, 0, 0, 1) if (l + 0.05) / 0.05 >= 1.05 / (l + 0.05) else (1, 1, 1, 1)
+
+
+def wavg(pairs):
+    """Moyenne pondérée [(valeur, coefficient)]"""
+    pairs = [(v, c if c and c > 0 else 1.0) for v, c in pairs if v is not None]
+    tot = sum(c for _, c in pairs)
+    return sum(v * c for v, c in pairs) / tot if tot else None
+
+
+BINS = [(0, 8, "<8"), (8, 10, "8-10"), (10, 12, "10-12"), (12, 14, "12-14"), (14, 16, "14-16"), (16, 20.01, "16+")]
+
+
+def compute_stats(d):
+    """À partir des données Pronote (dict) : moyennes, matières, répartition, évolution, devoirs, cours..."""
+    grades = [g for g in d.get("grades", []) if g.get("v") is not None]
+    by_sub = {}
+    for g in grades:
+        by_sub.setdefault(g["subject"], []).append(g)
+    official = {a["subject"]: a for a in d.get("averages", [])}
+    subs = []
+    for name in list(by_sub) + [n for n in official if n not in by_sub]:
+        gl = by_sub.get(name, [])
+        calc = wavg([(g["v"], g.get("coef") or 1.0) for g in gl])
+        off = official.get(name, {})
+        avg = norm20(off.get("student"), off.get("out_of") or "20")
+        avg = avg if avg is not None else calc
+        cls = norm20(off.get("class_avg"), off.get("out_of") or "20")
+        if cls is None:
+            cl = [g["class_v"] for g in gl if g.get("class_v") is not None]
+            cls = sum(cl) / len(cl) if cl else None
+        recent = sorted(gl, key=lambda g: g["date"])
+        trend = None
+        if len(recent) >= 2:
+            diff = recent[-1]["v"] - (sum(g["v"] for g in recent[:-1]) / (len(recent) - 1))
+            trend = "up" if diff > 1 else "down" if diff < -1 else "flat"
+        label, col = level(avg)
+        subs.append({"name": name, "avg": avg, "class": cls, "n": len(gl), "level": label, "color": col,
+                     "trend": trend, "gap": None if avg is None or cls is None else avg - cls})
+    subs.sort(key=lambda s: (s["avg"] is None, -(s["avg"] or 0)))
+    ranked = [s for s in subs if s["avg"] is not None]
+    overall = norm20(d.get("overall"), "20")
+    if overall is None and ranked:
+        overall = sum(s["avg"] for s in ranked) / len(ranked)
+    class_overall = norm20(d.get("class_overall"), "20")
+    bins = [sum(1 for g in grades if lo <= g["v"] < hi) for lo, hi, _ in BINS]
+    chron = sorted(grades, key=lambda g: g["date"])
+    recent_vals = [g["v"] for g in chron][-12:]
+    trend = None
+    if len(chron) >= 4:
+        last = [g["v"] for g in chron][-3:]
+        prev = [g["v"] for g in chron][-6:-3]
+        if prev:
+            diff = sum(last) / len(last) - sum(prev) / len(prev)
+            trend = "up" if diff > 0.5 else "down" if diff < -0.5 else "flat"
+    best = max(grades, key=lambda g: g["v"]) if grades else None
+    worst = min(grades, key=lambda g: g["v"]) if grades else None
+    hw = d.get("homework", [])
+    todo = [h for h in hw if not h.get("done")]
+    today = d.get("today", "")
+    lessons_today = [l for l in d.get("lessons", []) if l.get("day") == today]
+    now = d.get("now", "")
+    nxt = next((l for l in lessons_today if not l.get("canceled") and l["end"] > now), None)
+    return {
+        "overall": overall, "class_overall": class_overall,
+        "gap": None if overall is None or class_overall is None else overall - class_overall,
+        "level": level(overall), "n_grades": len(grades), "subjects": subs,
+        "best_subject": ranked[0] if ranked else None, "worst_subject": ranked[-1] if len(ranked) > 1 else None,
+        "best": best, "worst": worst, "bins": bins, "recent": recent_vals, "trend": trend,
+        "hw_todo": len(todo), "hw_total": len(hw), "next_hw": todo[0] if todo else None,
+        "lessons_today": len(lessons_today), "canceled_today": sum(1 for l in lessons_today if l.get("canceled")),
+        "next_lesson": nxt,
+        "absences": d.get("absences", 0), "delays": d.get("delays", 0), "punishments": d.get("punishments", 0),
+    }
+
+
+def first_name(full):
+    """Pronote écrit « NOM Prénom » : on prend le premier mot qui n'est pas tout en majuscules."""
+    parts = (full or "").split()
+    return next((t for t in parts if t != t.upper()), parts[-1] if parts else "").title()
+
+
+DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+
+
+def day_label(iso):
+    try:
+        dd = datetime.strptime(iso, "%Y-%m-%d").date()
+    except Exception:
+        return iso
+    t = date.today()
+    if dd == t:
+        return "Aujourd'hui"
+    if dd == t + timedelta(days=1):
+        return "Demain"
+    return "%s %02d/%02d" % (DAYS[dd.weekday()], dd.day, dd.month)
+
+
+def build_data(c):
+    """Lit toutes les données utiles dans pronotepy (chaque partie est protégée : une erreur n'arrête pas le reste)."""
+    d = {"name": "", "klass": "", "period": "", "grades": [], "averages": [], "overall": None, "class_overall": None,
+         "homework": [], "lessons": [], "absences": 0, "delays": 0, "punishments": 0, "warnings": []}
+    today = date.today()
+    d["today"] = today.isoformat()
+    d["now"] = datetime.now().strftime("%H:%M")
+    d["updated"] = d["now"]
+
+    def part(name, fn):
+        try:
+            fn()
+        except Exception as e:
+            d["warnings"].append("%s : %s" % (name, type(e).__name__))
+            log("données : « %s » indisponible (%s : %s)", name, type(e).__name__, str(e)[:100])
+
+    def ident():
+        d["name"] = c.info.name
+        try:
+            d["klass"] = c.info.class_name
+        except Exception:
+            pass
+    part("identité", ident)
+    period = None
+    try:
+        period = c.current_period
+        d["period"] = period.name
+    except Exception as e:
+        d["warnings"].append("période")
+        log("données : période indisponible (%s)", type(e).__name__)
+
+    def grades():
+        for g in period.grades:
+            out = g.out_of or "20"
+            d["grades"].append({
+                "subject": g.subject.name, "date": g.date.isoformat(), "text": str(g.grade), "out_of": out,
+                "v": norm20(g.grade, out), "coef": num(g.coefficient) or 1.0, "class_v": norm20(g.average, out),
+                "min": norm20(g.min, out), "max": norm20(g.max, out), "comment": g.comment or ""})
+    if period:
+        part("notes", grades)
+
+        def averages():
+            for a in period.averages:
+                d["averages"].append({"subject": a.subject.name, "student": a.student, "class_avg": a.class_average,
+                                      "out_of": a.out_of or "20"})
+        part("moyennes", averages)
+        part("moyenne générale", lambda: d.update(overall=period.overall_average))
+        part("moyenne de la classe", lambda: d.update(class_overall=period.class_overall_average))
+        part("absences", lambda: d.update(absences=sum(a.days or 0 for a in period.absences)))
+        part("retards", lambda: d.update(delays=len(period.delays)))
+        part("punitions", lambda: d.update(punishments=len(period.punishments)))
+
+    def homework():
+        for h in c.homework(today, today + timedelta(days=14)):
+            d["homework"].append({"subject": h.subject.name, "text": h.description or "", "date": h.date.isoformat(),
+                                  "done": bool(h.done)})
+        d["homework"].sort(key=lambda h: h["date"])
+    part("devoirs", homework)
+
+    def lessons():
+        for l in c.lessons(today, today + timedelta(days=5)):
+            d["lessons"].append({
+                "day": l.start.date().isoformat(), "start": l.start.strftime("%H:%M"), "end": l.end.strftime("%H:%M"),
+                "subject": l.subject.name if l.subject else (l.status or "Cours"), "room": l.classroom or "",
+                "teacher": l.teacher_name or "", "canceled": bool(l.canceled), "test": bool(getattr(l, "test", False))})
+        d["lessons"].sort(key=lambda l: (l["day"], l["start"]))
+    part("emploi du temps", lessons)
+    return d
+
+
+# =====================================================================================
+#  Thèmes, taille du texte, animations (réglages d'accessibilité)
+# =====================================================================================
+THEMES = {
+    "dark": dict(bg=(.05, .06, .11, 1), card=(.11, .12, .20, 1), card2=(.16, .17, .28, 1), text=(.96, .96, .99, 1),
+                 sub=(.68, .70, .82, 1), acc=(.58, .52, 1, 1), on_acc=(0, 0, 0, 1), track=(.22, .23, .36, 1), deco=(.58, .52, 1, .08)),
+    "light": dict(bg=(.94, .95, .99, 1), card=(1, 1, 1, 1), card2=(.89, .91, .98, 1), text=(.07, .08, .14, 1),
+                  sub=(.34, .36, .48, 1), acc=(.33, .27, .83, 1), on_acc=(1, 1, 1, 1), track=(.82, .85, .94, 1), deco=(.33, .27, .83, .09)),
+    "contrast": dict(bg=(0, 0, 0, 1), card=(.09, .09, .09, 1), card2=(.19, .19, .19, 1), text=(1, 1, 1, 1),
+                     sub=(.92, .92, .92, 1), acc=(1, .85, 0, 1), on_acc=(0, 0, 0, 1), track=(.35, .35, .35, 1), deco=(1, 1, 1, 0)),
+}
+TH = dict(THEMES["dark"])
+PREFS = {"scale": 1.0, "theme": "dark", "anim": True, "link": ""}
+
+
+def apply_theme():
+    TH.clear()
+    TH.update(THEMES.get(PREFS["theme"], THEMES["dark"]))
+    Window.clearcolor = TH["bg"]
+
+
+def fs(n):
+    return sp(n * PREFS["scale"])
+
+
+def R(n):
+    return dp(n)
+
+
+# =====================================================================================
+#  Éléments « bulles »
+# =====================================================================================
+class Bubble(BoxLayout):
+    """Conteneur tout rond (coins très arrondis)."""
+
+    def __init__(self, fill=None, radius=26, auto=False, **kw):
+        kw.setdefault("padding", R(16))
+        kw.setdefault("spacing", R(6))
+        super().__init__(**kw)
+        self.radius = radius
+        with self.canvas.before:
+            self._c = Color(*(fill or TH["card"]))
+            self._r = RoundedRectangle(radius=[R(radius)])
+        self.bind(pos=self._u, size=self._u)
+        if auto:
+            self.size_hint_y = None
+            self.bind(minimum_height=self.setter("height"))
+
+    def _u(self, *_):
+        self._r.pos, self._r.size = self.pos, self.size
+        self._r.radius = [min(R(self.radius), self.height / 2)]
+
+
+class Txt(Label):
+    """Texte qui revient à la ligne et prend la hauteur qu'il lui faut."""
+
+    def __init__(self, text="", size=14, color="text", bold=False, halign="left", **kw):
+        col = TH[color] if isinstance(color, str) else color
+        super().__init__(text=text, font_size=fs(size), color=col, bold=bold, halign=halign, valign="middle",
+                         size_hint_y=None, **kw)
+        self.bind(width=lambda i, w: setattr(i, "text_size", (w, None)))
+        self.bind(texture_size=lambda i, ts: setattr(i, "height", max(ts[1], R(18))))
+
+
+def col(*widgets, **kw):
+    b = BoxLayout(orientation="vertical", size_hint_y=None, spacing=kw.pop("spacing", R(4)), **kw)
+    b.bind(minimum_height=b.setter("height"))
+    for w in widgets:
+        b.add_widget(w)
+    return b
+
+
+def row(*widgets, **kw):
+    b = BoxLayout(orientation="horizontal", size_hint_y=None, spacing=kw.pop("spacing", R(12)), **kw)
+    b.bind(minimum_height=b.setter("height"))
+    for w in widgets:
+        b.add_widget(w)
+    return b
+
+
+class Disc(FloatLayout):
+    """Rond avec un texte au centre, et un anneau de progression facultatif."""
+
+    def __init__(self, text="", fill=None, text_color=None, size=64, font=20, ring=None, ring_color=None, **kw):
+        super().__init__(size_hint=(None, None), size=(R(size), R(size)), **kw)
+        self.ring, self.fill = ring, fill
+        self.ring_color = ring_color or TH["acc"]
+        with self.canvas.before:
+            self._fc = Color(*(fill or TH["card2"]))
+            self._e = Ellipse()
+            if ring is not None:
+                self._tc = Color(*TH["track"])
+                self._tl = Line(width=R(7))
+                self._rc = Color(*self.ring_color)
+                self._rl = Line(width=R(7), cap="round")
+        self.lab = Label(text=text, font_size=fs(font), bold=True, color=text_color or TH["text"], halign="center", valign="middle",
+                         size_hint=(1, 1), pos_hint={"x": 0, "y": 0})
+        self.lab.bind(size=lambda i, v: setattr(i, "text_size", v))
+        self.add_widget(self.lab)
+        self.bind(pos=self._u, size=self._u)
+
+    def _u(self, *_):
+        x, y = self.pos
+        w, h = self.size
+        if self.ring is None:
+            self._e.pos, self._e.size = self.pos, self.size
+        else:  # anneau : le disque est un peu plus petit
+            pad = R(11)
+            self._e.pos, self._e.size = (x + pad, y + pad), (w - 2 * pad, h - 2 * pad)
+            cx, cy, r = x + w / 2, y + h / 2, w / 2 - R(4)
+            self._tl.circle = (cx, cy, r)
+            self._rl.circle = (cx, cy, r, 0, 360 * max(0.001, min(1, self.ring)))
+
+
+class PillButton(ButtonBehavior, Bubble):
+    """Gros bouton arrondi (zone de toucher confortable)."""
+
+    def __init__(self, text, kind="card", size=16, height=56, on=None, **kw):
+        hh = R(height) * (1 + (PREFS["scale"] - 1) * 0.55)
+        fill = TH["acc"] if kind == "acc" else TH["card2"]
+        super().__init__(fill=fill, radius=height, size_hint_y=None, height=hh, padding=(R(18), 0), **kw)
+        self.lab = Label(text=text, font_size=fs(size), bold=True, color=TH["on_acc"] if kind == "acc" else TH["text"],
+                         halign="center", valign="middle")
+        self.lab.bind(size=lambda i, v: setattr(i, "text_size", v))
+        self.add_widget(self.lab)
+        self.bind(on_press=lambda *_: setattr(self, "opacity", 0.7), on_release=lambda *_: setattr(self, "opacity", 1))
+        if on:
+            self.bind(on_release=lambda *_: on())
+
+    def set_text(self, t):
+        self.lab.text = t
+
+
+def segmented(options, current, on_pick):
+    """Une rangée de gros boutons ronds : un seul est sélectionné."""
+    b = BoxLayout(size_hint_y=None, spacing=R(8), height=R(52) * (1 + (PREFS["scale"] - 1) * 0.55))
+    for value, label in options:
+        b.add_widget(PillButton(label, "acc" if value == current else "card", size=14, height=52, on=lambda v=value: on_pick(v)))
+    return b
+
+
+class BarRow(BoxLayout):
+    """Moyenne d'une matière : barre colorée, repère de la moyenne de la classe, et le texte en toutes lettres."""
+
+    def __init__(self, s, **kw):
+        super().__init__(orientation="vertical", size_hint_y=None, spacing=R(4), **kw)
+        avg, cls = s["avg"], s["class"]
+        head = row(Txt(s["name"], 15, bold=True), Txt(fmt(avg) + "/20", 15, "acc", bold=True, halign="right", size_hint_x=None, width=R(78)), spacing=R(6))
+        gap = "" if s["gap"] is None else "  |  %s%s vs classe" % ("+" if s["gap"] >= 0 else "-", fmt(abs(s["gap"])))
+        trend = {"up": "  |  en hausse", "down": "  |  en baisse", "flat": ""}.get(s["trend"], "")
+        sub = Txt("%s%s%s" % (s["level"], gap, trend), 12, "sub")
+        bar = Widget(size_hint_y=None, height=R(14))
+        with bar.canvas:
+            Color(*TH["track"])
+            self._t = RoundedRectangle(radius=[R(7)])
+            Color(*s["color"])
+            self._f = RoundedRectangle(radius=[R(7)])
+            Color(*TH["text"])
+            self._m = Rectangle()
+        def upd(*_):
+            x, y = bar.pos
+            w, h = bar.size
+            self._t.pos, self._t.size = (x, y), (w, h)
+            self._f.pos, self._f.size = (x, y), (max(h, w * min(1, (avg or 0) / 20)), h)
+            if cls is not None:
+                self._m.pos, self._m.size = (x + w * min(1, cls / 20) - R(1.5), y - R(2)), (R(3), h + R(4))
+            else:
+                self._m.size = (0, 0)
+        bar.bind(pos=upd, size=upd)
+        for w in (head, sub, bar):
+            self.add_widget(w)
+        self.bind(minimum_height=self.setter("height"))
+
+
+class HistCol(BoxLayout):
+    def __init__(self, label, count, top, color, **kw):
+        super().__init__(orientation="vertical", **kw)
+        self.add_widget(Txt(str(count), 13, "text", bold=True, halign="center"))
+        area = Widget()
+        with area.canvas:
+            Color(*color)
+            rr = RoundedRectangle(radius=[R(8)])
+        def upd(*_):
+            h = area.height * (count / top if top else 0)
+            rr.pos = (area.x + area.width * 0.18, area.y)
+            rr.size = (area.width * 0.64, max(h, R(4) if count else 0))
+        area.bind(pos=upd, size=upd)
+        self.add_widget(area)
+        self.add_widget(Txt(label, 11, "sub", halign="center"))
+
+
+class Histogram(BoxLayout):
+    def __init__(self, bins, **kw):
+        super().__init__(size_hint_y=None, height=R(150) * (1 + (PREFS["scale"] - 1) * 0.4), spacing=R(2), **kw)
+        top = max(bins) or 1
+        for (lo, hi, label), n in zip(BINS, bins):
+            self.add_widget(HistCol(label, n, top, level(lo + 0.5)[1]))
+
+
+class Spark(Widget):
+    """Courbe des dernières notes."""
+
+    def __init__(self, vals, **kw):
+        super().__init__(size_hint_y=None, height=R(110), **kw)
+        self.vals = vals
+        with self.canvas:
+            Color(*TH["track"])
+            self._g = Line(width=R(1))
+            Color(*TH["acc"])
+            self._l = Line(width=R(3), joint="round", cap="round")
+            self._dots = [Ellipse() for _ in vals]
+        self.bind(pos=self._u, size=self._u)
+
+    def _u(self, *_):
+        n = len(self.vals)
+        if n < 2:
+            return
+        lo, hi = max(0, min(self.vals) - 1), min(20, max(self.vals) + 1)
+        span = (hi - lo) or 1
+        pad = R(10)
+        pts = []
+        for i, v in enumerate(self.vals):
+            x = self.x + pad + (self.width - 2 * pad) * i / (n - 1)
+            y = self.y + pad + (self.height - 2 * pad) * (v - lo) / span
+            pts += [x, y]
+            self._dots[i].pos, self._dots[i].size = (x - R(5), y - R(5)), (R(10), R(10))
+        self._l.points = pts
+        self._g.points = [self.x, self.y + R(1), self.right, self.y + R(1)]
+
+
+# =====================================================================================
+#  Barre de navigation « bulle » flottante
+# =====================================================================================
 class NavIcon(Widget):
     kind = StringProperty("home")
     p = NumericProperty(0)  # 0 = inactif, 1 = actif
@@ -105,98 +544,90 @@ class NavIcon(Widget):
 
     def draw(self, *_):
         self.canvas.clear()
-        s = min(self.width, self.height) * 0.42 * (1 + 0.18 * self.p)
-        cx, cy = self.center_x, self.center_y + dp(3) * self.p
-        col = [GREY[i] + (ACCENT[i] - GREY[i]) * self.p for i in range(3)]
-
-        def P(pts):
-            return [v for x, y in pts for v in (cx + x * s, cy + y * s)]
-
-        w = dp(1.8)
+        s = min(self.width, self.height) * 0.30 * (1 + 0.15 * self.p)
+        cx, cy = self.center_x, self.center_y
+        acc, sub = TH["acc"], TH["sub"]
+        colr = [sub[i] + (acc[i] - sub[i]) * self.p for i in range(3)]
+        P = lambda pts: [v for x, y in pts for v in (cx + x * s, cy + y * s)]
+        w = max(R(1.8), R(1.8) * PREFS["scale"] * 0.8)
         with self.canvas:
-            Color(*col, 1)
+            if self.p > 0:
+                Color(acc[0], acc[1], acc[2], 0.22 * self.p)
+                r = s * 1.9
+                Ellipse(pos=(cx - r, cy - r), size=(2 * r, 2 * r))
+            Color(*colr, 1)
             if self.kind == "home":
-                Line(points=P([(-1, 0), (0, 0.9), (1, 0)]), width=w, joint="round", cap="round")
-                Line(points=P([(-0.7, 0), (-0.7, -0.9), (0.7, -0.9), (0.7, 0)]), width=w, joint="round", cap="round")
+                Line(points=P([(-1, 0), (0, .9), (1, 0)]), width=w, joint="round", cap="round")
+                Line(points=P([(-.7, 0), (-.7, -.9), (.7, -.9), (.7, 0)]), width=w, joint="round", cap="round")
             elif self.kind == "grades":
-                for x, h in ((-0.6, -0.2), (0, 0.3), (0.6, 0.85)):
-                    Line(points=P([(x, -0.9), (x, h)]), width=w * 1.6, cap="round")
+                for x, h in ((-.6, -.2), (0, .3), (.6, .85)):
+                    Line(points=P([(x, -.9), (x, h)]), width=w * 1.6, cap="round")
+            elif self.kind == "stats":
+                Line(circle=(cx, cy, .95 * s), width=w)
+                Line(points=P([(0, 0), (0, .95)]), width=w, cap="round")
+                Line(points=P([(0, 0), (.82, -.47)]), width=w, cap="round")
             elif self.kind == "homework":
-                Line(rounded_rectangle=(cx - 0.8 * s, cy - 0.9 * s, 1.6 * s, 1.8 * s, dp(4)), width=w)
-                Line(points=P([(-0.4, 0), (-0.1, -0.3), (0.45, 0.4)]), width=w, joint="round", cap="round")
+                Line(rounded_rectangle=(cx - .8 * s, cy - .9 * s, 1.6 * s, 1.8 * s, R(4)), width=w)
+                Line(points=P([(-.4, 0), (-.1, -.3), (.45, .4)]), width=w, joint="round", cap="round")
             else:  # edt
-                Line(rounded_rectangle=(cx - 0.9 * s, cy - 0.8 * s, 1.8 * s, 1.7 * s, dp(4)), width=w)
-                Line(points=P([(-0.9, 0.35), (0.9, 0.35)]), width=w)
-                Line(points=P([(-0.45, 0.7), (-0.45, 1.1)]), width=w, cap="round")
-                Line(points=P([(0.45, 0.7), (0.45, 1.1)]), width=w, cap="round")
+                Line(rounded_rectangle=(cx - .9 * s, cy - .8 * s, 1.8 * s, 1.7 * s, R(4)), width=w)
+                Line(points=P([(-.9, .35), (.9, .35)]), width=w)
+                Line(points=P([(-.45, .7), (-.45, 1.1)]), width=w, cap="round")
+                Line(points=P([(.45, .7), (.45, 1.1)]), width=w, cap="round")
 
 
 class NavTab(ButtonBehavior, BoxLayout):
     def __init__(self, kind, label, **kw):
-        super().__init__(orientation="vertical", padding=(0, dp(6)), **kw)
+        super().__init__(orientation="vertical", padding=(0, R(4)), **kw)
         self.icon = NavIcon(kind=kind)
-        self.lbl = Label(text=label, font_size=sp(11), color=GREY + (1,), size_hint_y=None, height=dp(16))
+        self.lbl = Label(text=label, font_size=fs(10.5), bold=True, color=TH["sub"], size_hint_y=None, height=fs(14))
         self.add_widget(self.icon)
         self.add_widget(self.lbl)
 
     def set_active(self, on):
-        Animation(p=1 if on else 0, d=0.35, t="out_back").start(self.icon)
-        Animation(color=(ACCENT if on else GREY) + (1,), d=0.25).start(self.lbl)
+        if PREFS["anim"]:
+            Animation(p=1 if on else 0, d=0.35, t="out_back").start(self.icon)
+        else:
+            self.icon.p = 1 if on else 0
+        self.lbl.color = TH["acc"] if on else TH["sub"]
 
 
-# ---------- Cartes & écrans ----------
-class Card(BoxLayout):
-    def __init__(self, title, sub="", right="", **kw):
-        super().__init__(size_hint_y=None, height=dp(66), padding=dp(14), spacing=dp(8), **kw)
-        with self.canvas.before:
-            Color(*CARD)
-            self._bg = RoundedRectangle(radius=[dp(16)])
-        self.bind(pos=lambda *_: setattr(self._bg, "pos", self.pos),
-                  size=lambda *_: setattr(self._bg, "size", self.size))
-        left = BoxLayout(orientation="vertical")
-        for txt, size, col in ((title, 15, TEXT), (sub, 12, GREY + (1,))):
-            lb = Label(text=txt, font_size=sp(size), color=col, halign="left", valign="middle")
-            lb.bind(size=lambda i, v: setattr(i, "text_size", v))
-            left.add_widget(lb)
-        self.add_widget(left)
-        self.add_widget(Label(text=right, font_size=sp(17), bold=True, color=ACCENT + (1,),
-                              size_hint_x=None, width=dp(70)))
+class Page(Screen):
+    """Une page défilante avec ses bulles. Le bas est laissé libre pour la barre flottante."""
 
-
-class ListScreen(Screen):
     def __init__(self, title, **kw):
         super().__init__(**kw)
-        self.root_box = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
-        self.root_box.add_widget(Label(text=title, font_size=sp(26), bold=True, color=TEXT,
-                                       size_hint_y=None, height=dp(48), halign="left",
-                                       text_size=(Window.width - dp(32), None)))
-        sv = ScrollView()
-        self.box = BoxLayout(orientation="vertical", spacing=dp(10), size_hint_y=None)
+        sv = ScrollView(do_scroll_x=False, bar_width=R(3))
+        self.box = BoxLayout(orientation="vertical", spacing=R(12), padding=(R(16), R(18), R(16), R(110)), size_hint_y=None)
         self.box.bind(minimum_height=self.box.setter("height"))
         sv.add_widget(self.box)
-        self.root_box.add_widget(sv)
-        self.add_widget(self.root_box)
+        self.add_widget(sv)
+        self.title = title
 
-    def set_items(self, items):
+    def fill(self, widgets):
         self.box.clear_widgets()
-        for t, s, r in items or [("Rien à afficher", "", "")]:
-            self.box.add_widget(Card(t, s, r))
+        for w in widgets:
+            self.box.add_widget(w)
 
 
-class HomeScreen(ListScreen):
-    def __init__(self, title, **kw):
-        super().__init__(title, **kw)
-        btn = Button(text="Se déconnecter", size_hint_y=None, height=dp(46), background_normal="",
-                     background_color=CARD, color=GREY + (1,))
-        btn.bind(on_release=lambda *_: App.get_running_app().logout())
-        self.root_box.add_widget(btn)
-        jb = Button(text="Journal (aide au dépannage)", size_hint_y=None, height=dp(40), background_normal="",
-                    background_color=BG, color=GREY + (1,), font_size=sp(12))
-        jb.bind(on_release=lambda *_: App.get_running_app().show_log())
-        self.root_box.add_widget(jb)
+def deco(widget):
+    """Quelques grosses bulles transparentes en fond (pour l'ambiance)."""
+    with widget.canvas.before:
+        Color(*TH["deco"])
+        els = [Ellipse() for _ in range(4)]
+    spec = [(0.78, 0.82, 0.55), (-0.12, 0.45, 0.42), (0.62, 0.08, 0.34), (0.10, 0.92, 0.26)]
+
+    def upd(*_):
+        for e, (fx, fy, fr) in zip(els, spec):
+            d = widget.width * fr
+            e.size = (d, d)
+            e.pos = (widget.x + widget.width * fx, widget.y + widget.height * fy)
+    widget.bind(pos=upd, size=upd)
 
 
-# ---------- Fenêtre de connexion EduConnect (WebView Android) ----------
+# =====================================================================================
+#  Fenêtre de connexion EduConnect (vraie fenêtre Android : tu te connectes toi-même sur la page EduConnect)
+# =====================================================================================
 class EduFlow:
     """Suit la navigation de la fenêtre : on est « connecté » quand on revient sur Pronote après être passé par EduConnect."""
 
@@ -298,7 +729,6 @@ class EduPopup:
             web.setWebViewClient(autoclass("android.webkit.WebViewClient")())  # reste dans la fenêtre pendant les redirections
             self._step("cookies")
             cm = autoclass("android.webkit.CookieManager").getInstance()
-            cm.removeAllCookies(None)  # connexion « propre »
             cm.setAcceptCookie(True)
             cm.setAcceptThirdPartyCookies(web, True)
             self._step("fenêtre")
@@ -398,44 +828,83 @@ class EduPopup:
             pass
 
 
-def open_in_browser(url):
-    """Ouvre un lien dans le navigateur du téléphone (Chrome)."""
+def clear_web_cookies():
+    """Efface la session EduConnect gardée par la fenêtre (utilisé à la déconnexion)."""
     try:
-        from jnius import autoclass
-        Intent, Uri = autoclass("android.content.Intent"), autoclass("android.net.Uri")
-        autoclass("org.kivy.android.PythonActivity").mActivity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        from android.runnable import run_on_ui_thread
+
+        def clear():
+            try:
+                from jnius import autoclass
+                autoclass("android.webkit.CookieManager").getInstance().removeAllCookies(None)
+                log("session EduConnect de la fenêtre effacée")
+            except Exception as e:
+                log("effacement de la session EduConnect impossible (%s)", type(e).__name__)
+        run_on_ui_thread(clear)()
     except Exception:
-        import webbrowser
-        webbrowser.open(url)
+        pass
 
 
-# ---------- App ----------
+
+
+# =====================================================================================
+#  Lien de l'établissement (avec ou sans « ?identifiant=... »)
+# =====================================================================================
+def clean_link(text):
+    t = "".join((text or "").strip().strip("\"'<>").split())
+    if not t:
+        return ""
+    if "://" not in t:
+        t = "https://" + t
+    return "https://" + t.split("://", 1)[1]
+
+
+def link_variants(link):
+    """Adresses à essayer avec pronotepy (la même page Pronote, écrite de plusieurs façons)."""
+    p = urlparse(clean_link(link))
+    path = p.path.replace("mobile.eleve.html", "eleve.html").replace("mobile.parent.html", "parent.html")
+    if not path.endswith(".html"):
+        path = (path.rstrip("/") or "/pronote") + "/eleve.html"
+    base = "%s://%s%s" % (p.scheme, p.netloc, path)
+    out = [base]
+    if p.query:
+        out.append(base + "?" + p.query)
+    out.append(clean_link(link))
+    return list(dict.fromkeys(out))
+
+
+def register_link_secrets(link):
+    q = parse_qs(urlparse(link).query)
+    for v in q.get("identifiant", []):
+        SECRETS.add(v)
+
+
+# =====================================================================================
+#  L'application
+# =====================================================================================
 class PronoteApp(App):
     POPUP_CLS = EduPopup
-    NO_ENT = "Aucun ENT (connexion directe)"
 
-    # --- construction de l'interface ---
+    # ---------- démarrage ----------
     def build(self):
         self.title = "Pronote"
-        self._auto_tried = False
-        self._saved = self._load_json("saved.json")  # {"mode","url","user","pwd","ent","auto"}
-        if self._saved:
-            SECRETS.update([self._saved.get("user", ""), self._saved.get("pwd", "")])
-        self.root_sm = ScreenManager(transition=FadeTransition(duration=0.2))
-        self.root_sm.add_widget(self._login())
-        self.root_sm.add_widget(self._main())
+        self._load_prefs()
+        apply_theme()
+        self.data = self.stats = self.client = None
+        self.busy = False
+        self.root_sm = ScreenManager(transition=NoTransition())
+        self._build_screens()
         return self.root_sm
 
     def on_start(self):
         import kivy
         try:
             os.makedirs(self.user_data_dir, exist_ok=True)
-            if os.path.getsize(self._path("app.log")) > 200_000:  # journal trop gros : on repart de zéro
+            if os.path.getsize(self._path("app.log")) > 200_000:
                 os.remove(self._path("app.log"))
         except OSError:
             pass
-        log("=== démarrage : appli %s | Python %s | Kivy %s | plateforme %s", APP_VERSION, sys.version.split()[0],
-            kivy.__version__, platform)
+        log("=== démarrage : appli %s | Python %s | Kivy %s | plateforme %s", APP_VERSION, sys.version.split()[0], kivy.__version__, platform)
         try:
             from importlib.metadata import version
             log("pronotepy %s", version("pronotepy"))
@@ -447,199 +916,48 @@ class PronoteApp(App):
                 log("module %s : ok", mod)
             except Exception as e:
                 log("module %s : MANQUANT (%s)", mod, type(e).__name__)
-        log("modes disponibles : %s | ENT connus : %d | identifiants enregistrés : %s | jeton enregistré : %s",
-            list(self.mode.values), len(self.ent.values) - 1, bool(self._saved), bool(self._load_json("creds.json")))
-        # Reconnexion automatique : d'abord par jeton (QR code / connexion précédente), sinon avec les identifiants enregistrés
+        if os.path.exists(self._path("saved.json")):  # ancienne version : des mots de passe étaient enregistrés -> on les efface
+            try:
+                os.remove(self._path("saved.json"))
+                log("anciens identifiants enregistrés : supprimés")
+            except OSError:
+                pass
+        if PREFS["link"]:
+            register_link_secrets(PREFS["link"])
         creds = self._load_json("creds.json")
+        log("réglages : taille %s, thème %s, animations %s | lien enregistré : %s | jeton enregistré : %s",
+            PREFS["scale"], PREFS["theme"], PREFS["anim"], bool(PREFS["link"]), bool(creds))
         if creds:
-            self.status.text = "Reconnexion..."
-            threading.Thread(target=self._work, args=("token", creds), daemon=True).start()
-        else:
-            self._auto_pwd()
+            self.set_status("Reconnexion...")
+            self._start("token", creds)
 
-    def _auto_pwd(self):
-        """Connexion automatique avec les identifiants enregistrés (une seule tentative par lancement)."""
-        sv = self._saved
-        if not sv or not sv.get("auto") or self._auto_tried or sv.get("mode") == MODE_WEB:
-            return
-        self._auto_tried = True
-        log("connexion automatique avec les identifiants enregistrés (mode : %s)", sv.get("mode"))
-        self.status.text = "Connexion avec tes identifiants enregistrés..."
-        payload = {k: sv.get(k, "") for k in ("url", "user", "pwd", "ent", "mode")}
-        payload["ent"] = "EDUCONNECT" if sv.get("mode") == MODE_EDU else sv.get("ent", self.NO_ENT)
-        payload["remember"] = True
-        threading.Thread(target=self._work, args=("pwd", payload), daemon=True).start()
-
-    def forget_saved(self, *_):
-        try:
-            os.remove(self._path("saved.json"))
-        except OSError:
-            pass
-        self._saved = None
-        self.user.text = self.pwd.text = ""
-        self.status.text = "Identifiants enregistrés effacés."
-        log("identifiants enregistrés effacés")
-        self._on_mode()
-
-    def show_log(self, *_):
-        text = "\n".join(LOG_LINES[-150:]) or "(journal vide)"
-        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
-        sv = ScrollView()
-        lab = Label(text=text, font_size=sp(10), color=TEXT, halign="left", valign="top", size_hint_y=None)
-        lab.bind(width=lambda i, w: setattr(i, "text_size", (w, None)))
-        lab.bind(texture_size=lambda i, ts: setattr(i, "height", ts[1]))
-        sv.add_widget(lab)
-        box.add_widget(sv)
-        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
-        full = lambda: ("Journal Pronote app - version %s\n" % APP_VERSION) + "\n".join(LOG_LINES)
-        bcopy = Button(text="Copier le journal", background_normal="", background_color=ACCENT + (1,), bold=True)
-        bclear = Button(text="Effacer", background_normal="", background_color=CARD, color=TEXT)
-        bclose = Button(text="Fermer", background_normal="", background_color=CARD, color=TEXT)
-        pop = Popup(title="Journal (copie-le et envoie-le moi)", content=box, size_hint=(0.97, 0.92))
-
-        def do_copy(*_):
-            Clipboard.copy(full())
-            bcopy.text = "Copié ✓"
-
-        def do_clear(*_):
-            del LOG_LINES[:]
-            lab.text = "(journal vide)"
-
-        bcopy.bind(on_release=do_copy)
-        bclear.bind(on_release=do_clear)
-        bclose.bind(on_release=pop.dismiss)
-        for b in (bcopy, bclear, bclose):
-            row.add_widget(b)
-        box.add_widget(row)
-        pop.open()
-
-    def _login(self):
-        s = Screen(name="login")
-        box = BoxLayout(orientation="vertical", padding=dp(28), spacing=dp(14), size_hint_y=None)
-        box.bind(minimum_height=box.setter("height"))
-        box.add_widget(Label(text="Pronote", font_size=sp(36), bold=True, color=ACCENT + (1,),
-                             size_hint_y=None, height=dp(90)))
-        kw = dict(multiline=False, size_hint_y=None, height=dp(48), background_color=CARD,
-                  foreground_color=TEXT, cursor_color=ACCENT + (1,), padding=(dp(14), dp(13)))
-        modes = ([MODE_WEB] if WEB_OK else []) + [MODE_EDU, MODE_QR, MODE_PWD]
-        self.mode = Spinner(text=modes[0], values=modes, size_hint_y=None, height=dp(48),
-                            background_normal="", background_color=CARD, color=TEXT)
-        self.mode.bind(text=self._on_mode)
-        # Méthode QR code
-        self.qr = TextInput(hint_text="Colle ici le contenu du QR code", **dict(kw, multiline=True, height=dp(110)))
-        self.pin = TextInput(hint_text="Code à 4 chiffres choisi avec le QR code", input_filter="int", **kw)
-        # Méthode identifiant / mot de passe
-        self.url = TextInput(hint_text="Lien Pronote du lycée", **kw)
-        self.ent = Spinner(text=self.NO_ENT, values=self._ent_list(), size_hint_y=None, height=dp(48),
-                           background_normal="", background_color=CARD, color=TEXT)
-        self.user = TextInput(hint_text="Identifiant", **kw)
-        self.pwd = TextInput(hint_text="Mot de passe", password=True, **kw)
-        self.form = BoxLayout(orientation="vertical", spacing=dp(14), size_hint_y=None)
-        self.form.bind(minimum_height=self.form.setter("height"))
-        self.status = Label(text="", color=GREY + (1,), size_hint_y=None, height=dp(64), font_size=sp(12),
-                            halign="center", valign="middle")
-        self.status.bind(width=lambda i, w: setattr(i, "text_size", (w, None)))
-        self.hint = Label(text="Une fenêtre s'ouvre sur la vraie page EduConnect de ton lycée : tu t'y connectes toi-même.",
-                          color=GREY + (1,), size_hint_y=None, height=dp(48), font_size=sp(12),
-                          halign="center", valign="middle")
-        self.hint.bind(width=lambda i, w: setattr(i, "text_size", (w, None)))
-        btn = Button(text="Se connecter", size_hint_y=None, height=dp(50), background_normal="",
-                     background_color=ACCENT + (1,), bold=True)
-        btn.bind(on_release=self.connect)
-        self.btn = btn
-        self.btn_open = Button(text="1. Ouvrir Pronote dans Chrome (EduConnect)", size_hint_y=None, height=dp(44),
-                               background_normal="", background_color=CARD, color=TEXT)
-        self.btn_open.bind(on_release=lambda *_: open_in_browser(self._clean_url(self.url.text)))
-        # « Se souvenir de mes identifiants » (enregistrés seulement sur ce téléphone, jamais envoyés ailleurs)
-        self.remember = CheckBox(active=True, size_hint_x=None, width=dp(40))
-        self.remember_row = BoxLayout(size_hint_y=None, height=dp(36))
-        self.remember_row.add_widget(self.remember)
-        rl = Label(text="Se souvenir de mes identifiants", color=GREY + (1,), font_size=sp(13), halign="left", valign="middle")
-        rl.bind(size=lambda i, v: setattr(i, "text_size", v))
-        self.remember_row.add_widget(rl)
-        self.btn_forget = Button(text="Oublier mes identifiants enregistrés", size_hint_y=None, height=dp(36),
-                                 background_normal="", background_color=CARD, color=GREY + (1,), font_size=sp(12))
-        self.btn_forget.bind(on_release=self.forget_saved)
-        jb = Button(text="Journal (aide au dépannage)", size_hint_y=None, height=dp(36), background_normal="",
-                    background_color=BG, color=GREY + (1,), font_size=sp(12))
-        jb.bind(on_release=self.show_log)
-        for w in (self.mode, self.form, self.status, btn, jb):
-            box.add_widget(w)
-        sv = ScrollView(do_scroll_x=False)
-        sv.add_widget(box)
-        s.add_widget(sv)
-        sv_ = self._saved or {}  # on remplit les champs avec les identifiants enregistrés
-        if sv_:
-            self.url.text, self.user.text, self.pwd.text = sv_.get("url", ""), sv_.get("user", ""), sv_.get("pwd", "")
-            if sv_.get("ent") in self.ent.values:
-                self.ent.text = sv_["ent"]
-            if sv_.get("mode") in self.mode.values:
-                self.mode.text = sv_["mode"]
-        self._on_mode()
-        return s
-
-    def _on_mode(self, *_):
-        self.form.clear_widgets()
-        self.btn.text = "Ouvrir EduConnect" if self.mode.text == MODE_WEB else "Se connecter"
-        if self.mode.text == MODE_WEB:
-            widgets = (self.url, self.hint)
-        elif self.mode.text == MODE_QR:
-            widgets = (self.url, self.btn_open, self.qr, self.pin)
-        elif self.mode.text == MODE_EDU:
-            widgets = (self.url, self.user, self.pwd, self.remember_row)
-        else:
-            widgets = (self.url, self.ent, self.user, self.pwd, self.remember_row)
-        if self._saved and self.mode.text in (MODE_EDU, MODE_PWD):
-            widgets = widgets + (self.btn_forget,)
-        log("mode choisi : %s", self.mode.text)
-        for w in widgets:
-            self.form.add_widget(w)
-
-    def _main(self):
-        s = Screen(name="main")
-        col = BoxLayout(orientation="vertical")
-        self.sm = ScreenManager(transition=FadeTransition(duration=0.15))
-        self.pages = {
-            "home": HomeScreen("Accueil", name="home"),
-            "grades": ListScreen("Notes", name="grades"),
-            "homework": ListScreen("Devoirs", name="homework"),
-            "edt": ListScreen("Emploi du temps", name="edt"),
-        }
-        for p in self.pages.values():
-            self.sm.add_widget(p)
-        col.add_widget(self.sm)
-        bar = BoxLayout(size_hint_y=None, height=dp(64))
-        self.tabs = {}
-        for k, lab in (("home", "Accueil"), ("grades", "Notes"), ("homework", "Devoirs"), ("edt", "EDT")):
-            t = NavTab(k, lab)
-            t.bind(on_release=lambda _, k=k: self.goto(k))
-            self.tabs[k] = t
-            bar.add_widget(t)
-        col.add_widget(bar)
-        s.add_widget(col)
-        self.tabs["home"].set_active(True)
-        return s
-
-    def goto(self, key):
-        self.sm.current = key
-        for k, t in self.tabs.items():
-            t.set_active(k == key)
-
-    # --- stockage local (jeton de reconnexion) ---
+    # ---------- fichiers ----------
     def _path(self, name):
         return os.path.join(self.user_data_dir, name)
 
     def _load_json(self, name):
         try:
-            with open(self._path(name)) as f:
+            with open(self._path(name), encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return None
 
     def _save_json(self, name, data):
         os.makedirs(self.user_data_dir, exist_ok=True)
-        with open(self._path(name), "w") as f:
+        with open(self._path(name), "w", encoding="utf-8") as f:
             json.dump(data, f)
+
+    def _load_prefs(self):
+        p = self._load_json("settings.json") or {}
+        for k in PREFS:
+            if k in p:
+                PREFS[k] = p[k]
+        if PREFS["theme"] not in THEMES:
+            PREFS["theme"] = "dark"
+        PREFS["scale"] = min(1.6, max(1.0, float(PREFS["scale"] or 1.0)))
+
+    def _save_prefs(self):
+        self._save_json("settings.json", PREFS)
 
     def _device_uuid(self):
         d = self._load_json("device.json")
@@ -648,221 +966,528 @@ class PronoteApp(App):
             self._save_json("device.json", d)
         return d["uuid"]
 
+    # ---------- écrans ----------
+    def _build_screens(self):
+        self.pg = {}
+        self.root_sm.add_widget(self._login_screen())
+        self.root_sm.add_widget(self._main_screen())
+        self.root_sm.add_widget(self._settings_screen())
+
+    def _login_screen(self):
+        s = Screen(name="login")
+        deco(s)
+        sv = ScrollView(do_scroll_x=False)
+        box = BoxLayout(orientation="vertical", padding=(R(22), R(36), R(22), R(30)), spacing=R(16), size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        logo = Disc("P", fill=TH["acc"], text_color=TH["on_acc"], size=92, font=44)
+        logo.pos_hint = {"center_x": .5}
+        wrap = FloatLayout(size_hint_y=None, height=R(100))
+        logo.pos_hint = {"center_x": .5, "center_y": .5}
+        wrap.add_widget(logo)
+        box.add_widget(wrap)
+        box.add_widget(Txt("Pronote", 32, "text", bold=True, halign="center"))
+        box.add_widget(Txt("Tes notes, tes devoirs et tes statistiques, simplement.", 15, "sub", halign="center"))
+        # champ du lien
+        inp = Bubble(radius=30, size_hint_y=None, height=R(60) * (1 + (PREFS["scale"] - 1) * 0.5), padding=(R(18), 0, R(6), 0), fill=TH["card"])
+        self.link_in = TextInput(text=PREFS["link"], hint_text="Colle ici le lien de ton lycée", multiline=False, font_size=fs(15),
+                                 background_color=(0, 0, 0, 0), background_normal="", background_active="", foreground_color=TH["text"],
+                                 hint_text_color=TH["sub"], cursor_color=TH["acc"], padding=(0, R(18)), input_type="url", write_tab=False)
+        inp.add_widget(self.link_in)
+        inp.add_widget(PillButton("Coller", "card", size=14, height=44, on=self.paste_link, size_hint_x=None, width=R(92) * PREFS["scale"]))
+        box.add_widget(inp)
+        self.login_status = Txt("", 14, "sub", halign="center")
+        box.add_widget(self.login_status)
+        self.btn_connect = PillButton("Se connecter avec EduConnect", "acc", size=17, height=64, on=self.connect)
+        box.add_widget(self.btn_connect)
+        help_ = Bubble(orientation="vertical", auto=True, padding=R(18), spacing=R(8))
+        for t in ("1.  Colle le lien donné par ton lycée.", "2.  Appuie sur le bouton ci-dessus.",
+                  "3.  Connecte-toi sur la page EduConnect qui s'ouvre. L'appli ne voit jamais ton mot de passe."):
+            help_.add_widget(Txt(t, 14, "text"))
+        box.add_widget(help_)
+        box.add_widget(row(PillButton("Réglages", "card", size=14, height=48, on=lambda: self.open_settings()),
+                           PillButton("Journal", "card", size=14, height=48, on=self.show_log), spacing=R(10)))
+        sv.add_widget(box)
+        s.add_widget(sv)
+        return s
+
+    def _main_screen(self):
+        s = Screen(name="main")
+        fl = FloatLayout()
+        deco(fl)
+        self.pages_sm = ScreenManager(transition=FadeTransition(duration=0.15) if PREFS["anim"] else NoTransition())
+        titles = (("home", "Accueil"), ("grades", "Notes"), ("stats", "Stats"), ("homework", "Devoirs"), ("edt", "Cours"))
+        for k, t in titles:
+            self.pg[k] = Page(t, name=k)
+            self.pages_sm.add_widget(self.pg[k])
+        fl.add_widget(self.pages_sm)
+        n = len(titles)
+        nav = BoxLayout(size_hint=(None, None), width=min(Window.width - R(20), R(520)), height=R(66) * (1 + (PREFS["scale"] - 1) * 0.55),
+                        pos_hint={"center_x": .5, "y": 0.012}, padding=(R(8), R(4)))
+        with nav.canvas.before:
+            Color(*TH["card2"])
+            rr = RoundedRectangle(pos=nav.pos, size=nav.size, radius=[nav.height / 2])
+        nav.bind(pos=lambda *_: setattr(rr, "pos", nav.pos), size=lambda *_: (setattr(rr, "size", nav.size), setattr(rr, "radius", [nav.height / 2])))
+        self.tabs = {}
+        for k, t in titles:
+            tab = NavTab(k if k != "grades" else "grades", t)
+            tab.bind(on_release=lambda _, k=k: self.goto(k))
+            self.tabs[k] = tab
+            nav.add_widget(tab)
+        fl.add_widget(nav)
+        s.add_widget(fl)
+        self.tabs["home"].set_active(True)
+        return s
+
+    def _settings_screen(self):
+        s = Screen(name="settings")
+        deco(s)
+        sv = ScrollView(do_scroll_x=False)
+        box = BoxLayout(orientation="vertical", padding=(R(18), R(24), R(18), R(40)), spacing=R(14), size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        box.add_widget(PillButton("Retour", "card", size=15, height=50, on=self.close_settings))
+        box.add_widget(Txt("Réglages", 28, "text", bold=True))
+
+        def section(title, widget):
+            b = Bubble(orientation="vertical", auto=True, padding=R(16), spacing=R(10))
+            b.add_widget(Txt(title, 16, "text", bold=True))
+            b.add_widget(widget)
+            box.add_widget(b)
+        section("Taille du texte", segmented([(1.0, "Normal"), (1.25, "Grand"), (1.5, "Très grand")], PREFS["scale"], lambda v: self.set_pref("scale", v)))
+        section("Thème", segmented([("dark", "Sombre"), ("light", "Clair"), ("contrast", "Contraste")], PREFS["theme"], lambda v: self.set_pref("theme", v)))
+        section("Animations", segmented([(True, "Oui"), (False, "Non")], PREFS["anim"], lambda v: self.set_pref("anim", v)))
+        acts = Bubble(orientation="vertical", auto=True, padding=R(16), spacing=R(10))
+        acts.add_widget(Txt("Compte", 16, "text", bold=True))
+        if self.data:
+            acts.add_widget(PillButton("Actualiser les données", "card", size=15, height=52, on=lambda: (self.close_settings(), self.refresh())))
+        acts.add_widget(PillButton("Journal (aide au dépannage)", "card", size=15, height=52, on=self.show_log))
+        if self.data or self._load_json("creds.json"):
+            acts.add_widget(PillButton("Se déconnecter", "card", size=15, height=52, on=self.logout))
+        box.add_widget(acts)
+        box.add_widget(Txt("Version %s" % APP_VERSION, 12, "sub", halign="center"))
+        sv.add_widget(box)
+        s.add_widget(sv)
+        return s
+
+    def open_settings(self):
+        self._back_to = self.root_sm.current
+        self.root_sm.current = "settings"
+
+    def close_settings(self):
+        self.root_sm.current = getattr(self, "_back_to", "login") if (self.data or getattr(self, "_back_to", "") == "login") else "login"
+        if self.root_sm.current == "main":
+            self.goto(self.pages_sm.current)
+
+    def set_pref(self, key, value):
+        PREFS[key] = value
+        self._save_prefs()
+        log("réglage : %s = %s", key, value)
+        Clock.schedule_once(lambda _: self.rebuild("settings"), 0)
+
+    def rebuild(self, stay):
+        """Reconstruit l'interface (nouvelle taille de texte, nouveau thème...) sans perdre les données."""
+        page = self.pages_sm.current if hasattr(self, "pages_sm") else "home"
+        link = self.link_in.text if hasattr(self, "link_in") else PREFS["link"]
+        apply_theme()
+        self.root_sm.transition = NoTransition()
+        self.root_sm.clear_widgets()
+        self._build_screens()
+        self.link_in.text = link
+        self.root_sm.current = stay
+        self.populate()
+        if stay == "main":
+            self.goto(page)
+
+    def goto(self, key):
+        self.pages_sm.current = key
+        for k, t in self.tabs.items():
+            t.set_active(k == key)
+
+    def set_status(self, text):
+        for attr in ("login_status",):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.text = text
+
+    # ---------- connexion EduConnect ----------
+    def paste_link(self, *_):
+        try:
+            t = Clipboard.paste() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            self.link_in.text = t.strip()
+            self.set_status("Lien collé.")
+        else:
+            self.set_status("Rien à coller : copie d'abord le lien de ton lycée.")
+
+    def connect(self, *_):
+        link = clean_link(self.link_in.text)
+        host = urlparse(link).netloc
+        log("bouton « Se connecter avec EduConnect » (hôte : %s)", host or "-")
+        if not host or "." not in host:
+            self.set_status("Colle d'abord le lien de ton lycée (il commence par https://).")
+            return
+        if "parent.html" in link:
+            self.set_status("Ce lien est celui d'un compte parent : l'appli gère seulement les comptes élèves.")
+            return
+        register_link_secrets(link)
+        PREFS["link"] = link
+        self._save_prefs()
+        self.set_status("Ouverture de la page EduConnect...")
+        try:
+            self.popup = self.POPUP_CLS(link, self._popup_done, self._popup_error)
+            self.popup.open()
+        except Exception as e:
+            self._popup_error("ERR %s" % e)
+
+    def _popup_error(self, msg):
+        log("fenêtre EduConnect : erreur (%s)", msg[:200])
+        if "annulée" in msg:
+            self.set_status("Connexion annulée.")
+        else:
+            self.set_status("La page EduConnect n'a pas pu s'ouvrir. Ouvre le Journal, copie-le et envoie-le moi. [%s]" % msg.replace("ERR ", "")[:150])
+
+    def _popup_done(self, url, cookies, trail=""):
+        if not any(cookies.values() if isinstance(cookies, dict) else [cookies]):
+            self.set_status("Aucune connexion détectée. Réessaie. [%s]" % trail)
+            return
+        self.set_status("Connexion à Pronote...")
+        self._start("web", {"link": url, "cookies": cookies, "trail": trail})
+
+    def _start(self, kind, p):
+        self.busy = True
+        threading.Thread(target=self._work, args=(kind, p), daemon=True).start()
+
+    @staticmethod
+    def _friendly(e):
+        s = str(e)
+        if "Page html is different" in s:
+            return "Pronote n'a pas accepté la connexion faite sur la page EduConnect."
+        if "IP address is suspended" in s:
+            return "Pronote a bloqué ton adresse IP un moment. Réessaie plus tard."
+        if "MFA" in type(e).__name__:
+            return "Ton compte demande une double authentification (pas gérée)."
+        if "Connection" in type(e).__name__ or "Max retries" in s:
+            return "Pas de connexion internet, ou lien Pronote incorrect."
+        return s[:200] or type(e).__name__
+
+    def _work(self, kind, p):
+        log("connexion : début (type : %s)", kind)
+        try:
+            import pronotepy
+            c = None
+            if kind == "web":
+                jar = cookie_jar(p["cookies"], p["link"])
+                last = None
+                for i, v in enumerate(link_variants(p["link"])):
+                    try:
+                        c = pronotepy.Client(v, username="webview", password="webview", ent=lambda *a, **k: jar)
+                        log("connexion : adresse n°%d acceptée par Pronote", i + 1)
+                        break
+                    except Exception as e:
+                        last = e
+                        log("connexion : adresse n°%d refusée (%s : %s)", i + 1, type(e).__name__, str(e)[:80])
+                if c is None:
+                    raise last
+                try:  # on échange la session contre un jeton : prochaines connexions sans refaire EduConnect
+                    pin = "".join(random.choice("123456789") for _ in range(4))
+                    c = pronotepy.Client.qrcode_login(c.request_qr_code_data(pin), pin, self._device_uuid())
+                    log("jeton de reconnexion créé")
+                except Exception as e:
+                    log("jeton de reconnexion impossible (%s : %s)", type(e).__name__, str(e)[:80])
+            elif kind == "token":
+                c = pronotepy.Client.token_login(**p)
+            else:  # refresh
+                c = self.client
+                try:
+                    d = build_data(c)
+                    if not d["name"]:
+                        raise RuntimeError("session expirée")
+                    log("actualisation : réussie")
+                    Clock.schedule_once(lambda _: self._done(d, c))
+                    return
+                except Exception as e:
+                    log("actualisation : la session n'est plus valable (%s), je tente le jeton", type(e).__name__)
+                    creds = self._load_json("creds.json")
+                    if not creds:
+                        raise RuntimeError("Session expirée : reconnecte-toi avec EduConnect.")
+                    c = pronotepy.Client.token_login(**creds)
+            if not c.logged_in:
+                raise RuntimeError("Connexion refusée")
+            try:
+                creds_new = c.export_credentials()
+                SECRETS.add(str(creds_new.get("password", "")))
+                self._save_json("creds.json", creds_new)  # le jeton change à chaque connexion
+            except Exception as e:
+                log("jeton non enregistré (%s)", type(e).__name__)
+            d = build_data(c)
+            log("connexion : RÉUSSIE (%s) | notes : %d, devoirs : %d, cours : %d, avertissements : %s", kind,
+                len(d["grades"]), len(d["homework"]), len(d["lessons"]), d["warnings"] or "aucun")
+            Clock.schedule_once(lambda _: self._done(d, c))
+        except Exception as e:
+            frames = " > ".join("%s:%s" % (os.path.basename(f.filename), f.lineno) for f in traceback.extract_tb(e.__traceback__)[-4:])
+            log("connexion : ÉCHEC (%s) | %s : %s | %s", kind, type(e).__name__, str(e)[:200], frames)
+            msg = self._friendly(e)
+            if kind == "web":
+                msg += " Réessaie ; si ça recommence, ouvre le Journal, copie-le et envoie-le moi. [%s]" % p.get("trail", "")
+            if kind == "token":
+                msg = "Ta session a expiré : appuie sur « Se connecter avec EduConnect »."
+                try:
+                    os.remove(self._path("creds.json"))
+                except OSError:
+                    pass
+            if kind == "refresh":
+                Clock.schedule_once(lambda _: self._refresh_failed(msg))
+            else:
+                Clock.schedule_once(lambda _: self.set_status(msg))
+        finally:
+            self.busy = False
+
+    def _done(self, d, c=None):
+        self.data, self.stats = d, compute_stats(d)
+        if c is not None:
+            self.client = c
+        self.set_status("")
+        self.populate()
+        self.root_sm.current = "main"
+        self.goto(self.pages_sm.current)
+
+    def _refresh_failed(self, msg):
+        self.home_msg.text = msg
+        log("actualisation : échec (%s)", msg[:120])
+
+    def refresh(self):
+        if self.busy or not self.data:
+            return
+        if hasattr(self, "home_msg"):
+            self.home_msg.text = "Actualisation..."
+        self._start("refresh", {})
+
     def logout(self):
         log("déconnexion")
         try:
             os.remove(self._path("creds.json"))
         except OSError:
             pass
-        if self._saved:  # on garde les identifiants pour pré-remplir, mais plus de reconnexion automatique
-            self._saved["auto"] = False
-            self._save_json("saved.json", self._saved)
-        self.status.text = ""
-        self.root_sm.current = "login"
+        clear_web_cookies()
+        self.data = self.stats = self.client = None
+        self.rebuild("login")
+        self.set_status("Tu es déconnecté.")
 
-    # --- connexion ---
-    def _ent_list(self):
-        # La liste des ENT vient directement de pronotepy (toujours à jour)
-        try:
-            import pronotepy.ent as ent
-            names = sorted(n for n in dir(ent) if not n.startswith("_") and callable(getattr(ent, n)))
-        except Exception:
-            names = []
-        return [self.NO_ENT] + names
-
-    @staticmethod
-    def _clean_url(url):
-        """Accepte n'importe quel lien donné par le lycée et en sort .../pronote/eleve.html"""
-        from urllib.parse import unquote, urlparse
-        url = "".join(url.strip().strip("\"'<>").split())  # espaces / retours à la ligne collés par erreur
-        if "service=" in url:  # lien EduConnect : https://.../cas/login?service=<lien Pronote>
-            url = unquote(url.split("service=", 1)[1].split("&")[0])
-        if "://" not in url:
-            url = "https://" + url
-        url = "https://" + url.split("://", 1)[1]
-        url = url.split("?")[0].split("#")[0]  # enlève ?login=true, etc.
-        url = url.replace("mobile.eleve.html", "eleve.html").replace("mobile.parent.html", "parent.html")
-        if "eleve.html" not in url and "parent.html" not in url:
-            p = urlparse(url)
-            path = p.path.rstrip("/")
-            if not path:
-                path = "/pronote"
-            url = f"{p.scheme}://{p.netloc}{path}/eleve.html"
-        return url
-
-    @staticmethod
-    def _friendly(e):
-        s = str(e)
-        if "Page html is different" in s:
-            return ("Le lien ne mène pas à la page de connexion Pronote (ton lycée utilise sûrement "
-                    "EduConnect). Utilise la méthode QR code.")
-        if "probably wrong login information" in s:
-            return "Identifiant ou mot de passe EduConnect incorrect."
-        if "HubEduConnect" in s:
-            return "Ton lycée n'est pas compatible avec cette connexion EduConnect. Utilise la méthode QR code."
-        if "Connection failure" in s:
-            return ("La connexion EduConnect automatique n'a pas abouti (ton lycée n'utilise sûrement pas ce chemin). "
-                    "Utilise la méthode QR code.")
-        if "IP address is suspended" in s:
-            return "Pronote a bloqué ton adresse IP un moment. Réessaie plus tard."
-        if "MFA" in type(e).__name__:
-            return "Ton compte demande une double authentification (pas encore gérée)."
-        if "QR" in type(e).__name__ or "decrypt" in s.lower():
-            return "QR code ou code à 4 chiffres incorrect (ou QR code expiré). Génère-en un nouveau."
-        if "Connection" in type(e).__name__ or "Max retries" in s:
-            return "Pas de connexion internet, ou lien Pronote incorrect."
-        return s[:220] or type(e).__name__
-
-    def open_popup(self):
-        url = self._clean_url(self.url.text)
-        if "parent.html" in url:
-            self.status.text = "Ce lien est celui d'un compte parent : l'app gère seulement les comptes élèves."
+    # ---------- contenu des pages ----------
+    def populate(self):
+        if not self.data:
             return
-        self.status.text = "Ouverture de la fenêtre EduConnect..."
-        log("ouverture de la fenêtre EduConnect (hôte : %s)", urlparse(url).netloc)
-        try:
-            self.popup = self.POPUP_CLS(url, self._popup_done, self._popup_error)
-            self.popup.open()
-        except Exception as e:
-            self._popup_error(str(e))
+        d, s = self.data, self.stats
+        self.pg["home"].fill(self._home(d, s))
+        self.pg["grades"].fill(self._grades(d, s))
+        self.pg["stats"].fill(self._stats(d, s))
+        self.pg["homework"].fill(self._homework(d, s))
+        self.pg["edt"].fill(self._edt(d, s))
 
-    def _popup_error(self, msg):
-        log("fenêtre EduConnect : erreur (%s)", msg[:200])
-        if "annulée" in msg:
-            self.status.text = "Connexion annulée."
-            return
-        self.status.text = "La fenêtre EduConnect n'a pas pu s'ouvrir. Utilise la méthode QR code. [%s]" % msg.replace("ERR ", "")[:170]
-        self.mode.text = MODE_QR
+    def _title(self, t, sub=""):
+        w = [Txt(t, 28, "text", bold=True)]
+        if sub:
+            w.append(Txt(sub, 13, "sub"))
+        return w
 
-    def _popup_done(self, url, cookies, trail=""):
-        if not any(cookies.values() if isinstance(cookies, dict) else [cookies]):
-            self.status.text = "Aucune connexion détectée. Réessaie, ou utilise la méthode QR code. [%s]" % trail
-            return
-        self.status.text = "Connexion à Pronote..."
-        threading.Thread(target=self._work, args=("web", {"url": url, "cookie": cookies, "trail": trail}),
-                         daemon=True).start()
+    def _tile(self, value, caption):
+        b = Bubble(orientation="vertical", auto=True, padding=R(14), spacing=R(2))
+        b.add_widget(Txt(value, 24, "acc", bold=True, halign="center"))
+        b.add_widget(Txt(caption, 12, "sub", halign="center"))
+        return b
 
-    def connect(self, *_):
-        log("bouton « connecter » (mode : %s, hôte : %s)", self.mode.text, urlparse(self._clean_url(self.url.text)).netloc or "-")
-        if self.mode.text == MODE_WEB:
-            return self.open_popup()
-        self.status.text = "Connexion..."
-        SECRETS.update([self.user.text.strip(), self.pwd.text])
-        if self.mode.text == MODE_QR:
-            args = ("qr", {"qr": self.qr.text.strip(), "pin": self.pin.text.strip()})
-        else:
-            ent = "EDUCONNECT" if self.mode.text == MODE_EDU else self.ent.text
-            args = ("pwd", {"url": self._clean_url(self.url.text), "user": self.user.text.strip(),
-                            "pwd": self.pwd.text, "ent": ent, "mode": self.mode.text,
-                            "remember": self.remember.active})
-        threading.Thread(target=self._work, args=args, daemon=True).start()
+    def _grid(self, tiles):
+        g = GridLayout(cols=2, spacing=R(10), size_hint_y=None)
+        g.bind(minimum_height=g.setter("height"))
+        for t in tiles:
+            g.add_widget(t)
+        return g
 
-    def _work(self, kind, p):
-        log("connexion : début (type : %s)", kind)
-        try:
-            import pronotepy
-            if kind == "qr":
-                try:
-                    qr = json.loads(p["qr"])
-                    qr["jeton"], qr["login"], qr["url"]
-                except Exception:
-                    raise Exception("Contenu du QR code invalide : colle tout le texte lu dans le QR code.")
-                if not (p["pin"].isdigit() and len(p["pin"]) == 4):
-                    raise Exception("Le code doit faire exactement 4 chiffres.")
-                c = pronotepy.Client.qrcode_login(qr, p["pin"], self._device_uuid())
-            elif kind == "token":
-                c = pronotepy.Client.token_login(**p)
-            elif kind == "web":
-                # cookies de la session EduConnect ouverte dans la fenêtre
-                jar = cookie_jar(p["cookie"], p["url"])
-                c = pronotepy.Client(p["url"], username="webview", password="webview", ent=lambda *a, **k: jar)
-            else:
-                import pronotepy.ent as ent_mod
-                if "parent.html" in p["url"]:
-                    raise Exception("Ce lien est celui d'un compte parent : l'app gère seulement les comptes élèves.")
-                if p["ent"] == "EDUCONNECT":
-                    # Connexion EduConnect via le hub d'Index Education (fonction nommée "bordeaux" dans pronotepy)
-                    ent = getattr(ent_mod, "bordeaux", None) or ent_mod.pronote_hubeduconnect(p["url"])
-                else:
-                    ent = None if p["ent"] == self.NO_ENT else getattr(ent_mod, p["ent"])
-                c = pronotepy.Client(p["url"], username=p["user"], password=p["pwd"], ent=ent)
-            if not c.logged_in:
-                raise Exception("Identifiants refusés")
-            if kind in ("pwd", "web"):
-                # On échange la connexion contre un jeton : plus besoin de ressaisir (ni de stocker) le mot de passe
-                try:
-                    pin = "".join(random.choice("123456789") for _ in range(4))
-                    c = pronotepy.Client.qrcode_login(c.request_qr_code_data(pin), pin, self._device_uuid())
-                except Exception:
-                    pass
-            if kind in ("qr", "token", "pwd", "web"):
-                try:
-                    self._save_json("creds.json", c.export_credentials())  # le jeton change à chaque connexion
-                except Exception:
-                    pass
-            grades = [(g.subject.name, g.date.strftime("%d/%m"), f"{g.grade}/{g.out_of}")
-                      for g in c.current_period.grades]
-            hw = [(h.subject.name, h.description[:80], h.date.strftime("%d/%m"))
-                  for h in c.homework(date.today())]
-            edt = [(l.subject.name if l.subject else "Cours", l.room or "", l.start.strftime("%H:%M"))
-                   for l in c.lessons(date.today())]
-            data = (c.info.name, grades, hw, edt)
-            log("connexion : RÉUSSIE (type : %s) | notes : %d, devoirs : %d, cours : %d", kind, len(grades), len(hw), len(edt))
-            if kind == "pwd":
-                self._remember_creds(p)
-            Clock.schedule_once(lambda _: self._done(data))
-        except Exception as e:
-            frames = " > ".join("%s:%s" % (os.path.basename(f.filename), f.lineno) for f in traceback.extract_tb(e.__traceback__)[-4:])
-            log("connexion : ÉCHEC (type : %s) | %s : %s | %s", kind, type(e).__name__, str(e)[:200], frames)
-            msg = self._friendly(e)
-            if kind == "web":
-                msg = ("Pronote n'a pas reconnu la connexion de la fenêtre EduConnect. Utilise la méthode QR code. [%s]"
-                       % p.get("trail", ""))
-            if kind == "token":
-                msg = "Session expirée, génère un nouveau QR code. (" + msg[:80] + ")"
-                try:
-                    os.remove(self._path("creds.json"))
-                except OSError:
-                    pass
-                Clock.schedule_once(lambda _: self._auto_pwd())  # le jeton ne marche plus : on essaie les identifiants enregistrés
-            Clock.schedule_once(lambda _: setattr(self.status, "text", msg))
-            if kind in ("pwd", "web") and "méthode QR code" in msg:  # on bascule sur le QR code, c'est la solution
-                Clock.schedule_once(lambda _: setattr(self.mode, "text", MODE_QR))
+    def _home(self, d, s):
+        out = self._title("Salut %s" % first_name(d["name"]),
+                          " • ".join(x for x in (d["klass"], d["period"], "mis à jour à %s" % d["updated"]) if x))
+        ov = s["overall"]
+        label, color = s["level"]
+        gap = s["gap"]
+        info = [Txt("Moyenne générale", 16, "text", bold=True), Txt(label, 15, "text")]
+        if s["class_overall"] is not None:
+            info.append(Txt("Classe : %s%s" % (fmt(s["class_overall"]), "" if gap is None else "  (%s%s)" % ("+" if gap >= 0 else "-", fmt(abs(gap)))), 13, "sub"))
+        if s["trend"]:
+            info.append(Txt({"up": "En hausse : tes dernières notes montent", "down": "En baisse : tes dernières notes baissent", "flat": "Stable : tes notes ne bougent pas beaucoup"}[s["trend"]], 13, "sub"))
+        big = Bubble(auto=True, padding=R(18), spacing=R(16), orientation="horizontal")
+        big.add_widget(Disc(fmt(ov), fill=TH["card2"], size=132, font=30, ring=(ov or 0) / 20, ring_color=color))
+        big.add_widget(col(*info, spacing=R(4)))
+        out.append(big)
+        tiles = [self._tile(str(s["n_grades"]), "notes"), self._tile(str(s["hw_todo"]), "devoirs à faire"),
+                 self._tile(str(s["lessons_today"]), "cours aujourd'hui"),
+                 self._tile(s["best_subject"]["name"] if s["best_subject"] else "—", "meilleure matière")]
+        out.append(self._grid(tiles))
+        nl = s["next_lesson"]
+        if nl:
+            b = Bubble(orientation="vertical", auto=True, padding=R(16))
+            b.add_widget(Txt("Prochain cours", 13, "sub"))
+            b.add_widget(Txt("%s  •  %s–%s" % (nl["subject"], nl["start"], nl["end"]), 17, "text", bold=True))
+            if nl["room"]:
+                b.add_widget(Txt("Salle %s" % nl["room"], 13, "sub"))
+            out.append(b)
+        nh = s["next_hw"]
+        if nh:
+            b = Bubble(orientation="vertical", auto=True, padding=R(16))
+            b.add_widget(Txt("Prochain devoir à faire", 13, "sub"))
+            b.add_widget(Txt("%s  •  pour %s" % (nh["subject"], day_label(nh["date"])), 16, "text", bold=True))
+            b.add_widget(Txt(nh["text"][:160], 13, "text"))
+            out.append(b)
+        self.home_msg = Txt("", 13, "sub", halign="center")
+        out.append(self.home_msg)
+        out.append(row(PillButton("Actualiser", "acc", size=15, height=52, on=self.refresh),
+                       PillButton("Réglages", "card", size=15, height=52, on=self.open_settings), spacing=R(10)))
+        return out
 
-    def _remember_creds(self, p):
-        """Enregistre (ou efface) les identifiants sur le téléphone, selon la case « Se souvenir »."""
-        try:
-            if p.get("remember"):
-                self._saved = {"mode": p.get("mode", MODE_EDU), "url": p["url"], "user": p["user"], "pwd": p["pwd"],
-                               "ent": p.get("ent", ""), "auto": True}
-                if self._saved["ent"] == "EDUCONNECT":
-                    self._saved["ent"] = self.NO_ENT
-                self._save_json("saved.json", self._saved)
-                try:
-                    os.chmod(self._path("saved.json"), 0o600)  # lisible seulement par l'appli
-                except OSError:
-                    pass
-                log("identifiants enregistrés sur ce téléphone")
-            else:
-                self.forget_saved_silent()
-        except Exception as e:
-            log("enregistrement des identifiants impossible : %s", type(e).__name__)
+    def _grades(self, d, s):
+        out = self._title("Notes", "%d notes • %s" % (s["n_grades"], d["period"]))
+        gl = sorted(d["grades"], key=lambda g: g["date"], reverse=True)[:80]
+        if not gl:
+            out.append(Txt("Aucune note pour le moment.", 15, "sub"))
+        for g in gl:
+            v = g["v"]
+            lab, colr = level(v)
+            disc = Disc(fmt(v) if v is not None else g["text"][:4], fill=colr if v is not None else TH["track"],
+                        text_color=best_text(colr) if v is not None else TH["text"], size=62, font=17)
+            more = []
+            if g["out_of"] not in ("20", "20,00"):
+                more.append("note : %s/%s" % (g["text"], g["out_of"]))
+            if abs((g["coef"] or 1) - 1) > 1e-9:
+                more.append("coef %s" % fmt(g["coef"], 1).replace(",0", ""))
+            line2 = [datetime.strptime(g["date"], "%Y-%m-%d").strftime("%d/%m")] + more
+            line3 = lab
+            if g["class_v"] is not None and v is not None:
+                diff = v - g["class_v"]
+                line3 += "  |  classe %s (%s%s)" % (fmt(g["class_v"]), "+" if diff >= 0 else "-", fmt(abs(diff)))
+            b = Bubble(auto=True, padding=R(12), spacing=R(12), orientation="horizontal")
+            b.add_widget(disc)
+            b.add_widget(col(Txt(g["subject"], 15, "text", bold=True), Txt("  •  ".join(line2), 12, "sub"), Txt(line3, 12, "sub")))
+            out.append(b)
+        return out
 
-    def forget_saved_silent(self):
-        try:
-            os.remove(self._path("saved.json"))
-        except OSError:
-            pass
-        self._saved = None
+    def _stats(self, d, s):
+        out = self._title("Statistiques", d["period"])
+        gap = s["gap"]
+        tiles = [self._tile(fmt(s["overall"]), "moyenne générale"), self._tile(fmt(s["class_overall"]), "moyenne de la classe")]
+        if s["best"]:
+            tiles += [self._tile("%s" % fmt(s["best"]["v"]), "meilleure note (%s)" % s["best"]["subject"]),
+                      self._tile("%s" % fmt(s["worst"]["v"]), "note la plus basse (%s)" % s["worst"]["subject"])]
+        out.append(self._grid(tiles))
+        if gap is not None:
+            out.append(Txt("Tu es %s la moyenne de la classe de %s point(s)." % ("au-dessus de" if gap >= 0 else "en dessous de", fmt(abs(gap))), 14, "text"))
+        subs = [x for x in s["subjects"] if x["avg"] is not None]
+        if subs:
+            out.append(Txt("Tes matières", 20, "text", bold=True))
+            grid = GridLayout(cols=3, spacing=R(10), size_hint_y=None)
+            grid.bind(minimum_height=grid.setter("height"))
+            for x in subs:
+                cell = col(Txt(x["name"], 12, "text", halign="center"), spacing=R(4))
+                dd = Disc(fmt(x["avg"]), fill=x["color"], text_color=best_text(x["color"]), size=min(70 + 6 * x["n"], 96), font=17)
+                holder = FloatLayout(size_hint_y=None, height=R(100))
+                dd.pos_hint = {"center_x": .5, "center_y": .5}
+                holder.add_widget(dd)
+                cell.add_widget(holder)
+                cell.add_widget(Txt(x["level"], 11, "sub", halign="center"))
+                grid.add_widget(cell)
+            out.append(grid)
+            out.append(Txt("Moyenne par matière (le trait = la classe)", 18, "text", bold=True))
+            bars = Bubble(orientation="vertical", auto=True, padding=R(16), spacing=R(14))
+            for x in subs:
+                bars.add_widget(BarRow(x))
+            out.append(bars)
+        if s["n_grades"]:
+            out.append(Txt("Répartition de tes notes", 20, "text", bold=True))
+            hb = Bubble(orientation="vertical", auto=True, padding=R(14))
+            hb.add_widget(Histogram(s["bins"]))
+            out.append(hb)
+            if len(s["recent"]) >= 2:
+                out.append(Txt("Évolution de tes dernières notes", 20, "text", bold=True))
+                sb = Bubble(orientation="vertical", auto=True, padding=R(14))
+                sb.add_widget(Spark(s["recent"]))
+                tr = {"up": "Ça monte ces derniers temps.", "down": "Ça baisse un peu ces derniers temps.", "flat": "C'est stable."}.get(s["trend"], "")
+                if tr:
+                    sb.add_widget(Txt(tr, 13, "sub"))
+                out.append(sb)
+        out.append(Txt("Vie scolaire", 20, "text", bold=True))
+        out.append(self._grid([self._tile(str(s["absences"]), "jour(s) d'absence"), self._tile(str(s["delays"]), "retard(s)"),
+                               self._tile(str(s["punishments"]), "punition(s)"), self._tile("%d/%d" % (s["hw_total"] - s["hw_todo"], s["hw_total"]), "devoirs faits")]))
+        return out
 
-    def _done(self, data):
-        name, grades, hw, edt = data
-        self.status.text = ""
-        self.pages["home"].set_items([(f"Salut {name}", "Connecté à Pronote", "")])
-        self.pages["grades"].set_items(grades)
-        self.pages["homework"].set_items(hw)
-        self.pages["edt"].set_items(edt)
-        self.root_sm.current = "main"
+    def _homework(self, d, s):
+        out = self._title("Devoirs", "%d à faire sur %d pour les 2 prochaines semaines" % (s["hw_todo"], s["hw_total"]))
+        if not d["homework"]:
+            out.append(Txt("Aucun devoir pour le moment.", 15, "sub"))
+        last = None
+        for h in d["homework"]:
+            if h["date"] != last:
+                last = h["date"]
+                out.append(Txt(day_label(h["date"]), 17, "acc", bold=True))
+            b = Bubble(orientation="vertical", auto=True, padding=R(14), spacing=R(4))
+            state = "Fait" if h["done"] else "À faire"
+            b.add_widget(Txt("%s  —  %s" % (h["subject"], state), 15, "text", bold=True))
+            b.add_widget(Txt(h["text"] or "(pas de détail)", 13, "sub" if h["done"] else "text"))
+            out.append(b)
+        return out
+
+    def _edt(self, d, s):
+        out = self._title("Emploi du temps", "les 5 prochains jours")
+        if not d["lessons"]:
+            out.append(Txt("Aucun cours trouvé.", 15, "sub"))
+        last = None
+        for l in d["lessons"]:
+            if l["day"] != last:
+                last = l["day"]
+                out.append(Txt(day_label(l["day"]), 17, "acc", bold=True))
+            b = Bubble(auto=True, padding=R(12), spacing=R(12), orientation="horizontal")
+            b.add_widget(Txt("%s\n%s" % (l["start"], l["end"]), 14, "text", bold=True, size_hint_x=None, width=R(64) * PREFS["scale"]))
+            tags = []
+            if l["canceled"]:
+                tags.append("ANNULÉ")
+            if l["test"]:
+                tags.append("ÉVALUATION")
+            info = [Txt(l["subject"], 15, "sub" if l["canceled"] else "text", bold=True)]
+            line = "  •  ".join(x for x in ((("Salle " + l["room"]) if l["room"] else ""), l["teacher"]) if x)
+            if line:
+                info.append(Txt(line, 12, "sub"))
+            if tags:
+                info.append(Txt(" — ".join(tags), 12, "acc", bold=True))
+            b.add_widget(col(*info))
+            out.append(b)
+        return out
+
+    # ---------- journal ----------
+    def show_log(self, *_):
+        text = "\n".join(LOG_LINES[-150:]) or "(journal vide)"
+        box = BoxLayout(orientation="vertical", spacing=R(8), padding=R(8))
+        sv = ScrollView()
+        lab = Label(text=text, font_size=sp(10), color=TH["text"], halign="left", valign="top", size_hint_y=None)
+        lab.bind(width=lambda i, w: setattr(i, "text_size", (w, None)))
+        lab.bind(texture_size=lambda i, ts: setattr(i, "height", ts[1]))
+        sv.add_widget(lab)
+        box.add_widget(sv)
+        rw = BoxLayout(size_hint_y=None, height=R(52), spacing=R(8))
+        pop = Popup(title="Journal (copie-le et envoie-le moi)", content=box, size_hint=(0.97, 0.92), background="",
+                    background_color=TH["card"], title_color=TH["text"], separator_color=TH["acc"])
+        copy_btn = PillButton("Copier le journal", "acc", size=14, height=48)
+
+        def do_copy(*_):
+            Clipboard.copy(("Journal Pronote app - version %s\n" % APP_VERSION) + "\n".join(LOG_LINES))
+            copy_btn.set_text("Copié !")
+
+        def do_clear(*_):
+            del LOG_LINES[:]
+            lab.text = "(journal vide)"
+        copy_btn.bind(on_release=do_copy)
+        rw.add_widget(copy_btn)
+        rw.add_widget(PillButton("Effacer", "card", size=14, height=48, on=lambda: do_clear()))
+        rw.add_widget(PillButton("Fermer", "card", size=14, height=48, on=pop.dismiss))
+        box.add_widget(rw)
+        pop.open()
 
 
 if __name__ == "__main__":
