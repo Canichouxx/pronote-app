@@ -628,6 +628,9 @@ def deco(widget):
 # =====================================================================================
 #  Fenêtre de connexion EduConnect (vraie fenêtre Android : tu te connectes toi-même sur la page EduConnect)
 # =====================================================================================
+DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+
 class EduFlow:
     """Suit la navigation de la fenêtre : on est « connecté » quand on revient sur Pronote après être passé par EduConnect."""
 
@@ -655,7 +658,7 @@ def cookie_jar(cookies, url):
     if not isinstance(cookies, dict):
         cookies = {url: cookies}
     for site, cookie in cookies.items():
-        host = urlparse(site).netloc
+        host = urlparse(site).hostname or ""
         for part in (cookie or "").split(";"):
             if "=" in part:
                 k, v = part.strip().split("=", 1)
@@ -684,6 +687,8 @@ class EduPopup:
         self.flow = EduFlow(url)
         self.cur_url, self.cookie = "", ""
         self.hosts = [urlparse(url).netloc]  # sites visités pendant la connexion
+        self.pages = []  # pages visitées (adresse sans « ? »), pour demander aussi les cookies propres à chaque chemin
+        self.ua = ""  # « User-Agent » de la fenêtre
         self.cookies = {}  # {adresse: cookies}
         self.finished = False
         self._step("début")  # étape en cours (pour dire où ça bloque en cas d'erreur)
@@ -726,9 +731,17 @@ class EduPopup:
             st = web.getSettings()
             st.setJavaScriptEnabled(True)
             st.setDomStorageEnabled(True)
+            for call, arg in (("setUserAgentString", DESKTOP_UA), ("setUseWideViewPort", True), ("setLoadWithOverviewMode", True),
+                              ("setSupportZoom", True), ("setBuiltInZoomControls", True), ("setDisplayZoomControls", False)):
+                try:  # page « ordinateur » : la page mobile de Pronote renvoie vers Google Play
+                    getattr(st, call)(arg)
+                except Exception as e:
+                    log("fenêtre : réglage %s impossible (%s)", call, type(e).__name__)
+            self.ua = DESKTOP_UA
             web.setWebViewClient(autoclass("android.webkit.WebViewClient")())  # reste dans la fenêtre pendant les redirections
             self._step("cookies")
             cm = autoclass("android.webkit.CookieManager").getInstance()
+            cm.removeAllCookies(None)  # connexion « propre » : on refait tout le parcours EduConnect à chaque fois
             cm.setAcceptCookie(True)
             cm.setAcceptThirdPartyCookies(web, True)
             self._step("fenêtre")
@@ -763,17 +776,21 @@ class EduPopup:
                     self._see(hist.getItemAtIndex(i).getUrl())
             except Exception:
                 pass
-            sites = [self.url] + ["https://%s/" % h for h in self.hosts] + list(self.DEFAULT_SITES)
+            sites = [self.url] + self.pages + ["https://%s/" % h for h in self.hosts] + list(self.DEFAULT_SITES)
             self.cookies = {u: self.cm.getCookie(u) or "" for u in dict.fromkeys(sites)}
             self.cookie = self.cookies.get(self.url, "")
         except Exception:
             pass
 
     def _see(self, url):
-        host = urlparse(url or "").netloc
+        p = urlparse(url or "")
+        host = p.netloc
         if host and host not in self.hosts:
             self.hosts.append(host)
-            log("fenêtre : nouvelle page visitée (%s)", host)
+        page = "%s://%s%s" % (p.scheme, host, p.path) if host else ""
+        if page and page not in self.pages:
+            self.pages.append(page)
+            log("fenêtre : nouvelle page visitée (%s%s)", host, p.path[:60])
 
     def _poll(self, dt):
         if self.finished:
@@ -808,8 +825,12 @@ class EduPopup:
             SECRETS.update(p.partition("=")[2].strip() for p in c.split(";"))
         log("fenêtre : terminée, parcours = %s, sites avec cookies = %d, retour sur Pronote = %s",
             short_trail(self.hosts), len(cookies), self.flow.left)
+        for u, c in cookies.items():  # on note les NOMS des cookies (jamais leurs valeurs)
+            log("fenêtre : cookies de %s%s : %s", urlparse(u).netloc, urlparse(u).path[:30],
+                ", ".join(p.partition("=")[0].strip() for p in c.split(";")))
+        log("fenêtre : user-agent %s", (self.ua or "?")[:90])
         self._close()
-        self.on_done(self.url, cookies, short_trail(self.hosts))
+        self.on_done(self.url, cookies, short_trail(self.hosts), self.ua)
 
     def _close(self):
         def close():
@@ -871,6 +892,42 @@ def link_variants(link):
         out.append(base + "?" + p.query)
     out.append(clean_link(link))
     return list(dict.fromkeys(out))
+
+
+def desktop_link(link):
+    """La page Pronote « ordinateur » (sans mobile. ni ?identifiant=...) : la page mobile renvoie vers Google Play."""
+    p = urlparse(clean_link(link))
+    path = p.path.replace("mobile.eleve.html", "eleve.html").replace("mobile.parent.html", "parent.html")
+    if not path.endswith(".html"):
+        path = (path.rstrip("/") or "/pronote") + "/eleve.html"
+    return "%s://%s%s" % (p.scheme, p.netloc, path)
+
+
+def diagnose(jar, url, ua=""):
+    """Refait la requête de pronotepy avec les mêmes cookies et décrit ce que Pronote répond (sans cookie, sans ticket)."""
+    import re
+    import requests
+    out = []
+    try:
+        s = requests.Session()
+        s.headers["User-Agent"] = ua or "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:73.0) Gecko/20100101 Firefox/73.0"
+        for c in jar:
+            s.cookies.set_cookie(c)
+        r = s.get(url, timeout=20, allow_redirects=True)
+        for h in r.history:
+            hp = urlparse(h.url)
+            out.append("%d %s%s (cookies reçus : %d)" % (h.status_code, hp.hostname, hp.path[:50], len(h.cookies)))
+        fp = urlparse(r.url)
+        body = r.text or ""
+        m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+        low = body.lower()
+        words = [w for w in ("start(", "educonnect", "monbureaunumerique", "mot de passe", "identifiant", "erreur", "refus", "ticket",
+                             "expir", "form", "login") if w in low]
+        out.append("FINAL %d %s%s | longueur %d | titre : %s | mots : %s" % (
+            r.status_code, fp.hostname, fp.path[:50], len(body), (m.group(1).strip()[:60] if m else "-"), ",".join(words) or "-"))
+    except Exception as e:
+        out.append("diagnostic impossible : %s : %s" % (type(e).__name__, str(e)[:100]))
+    return out
 
 
 def register_link_secrets(link):
@@ -1135,7 +1192,9 @@ class PronoteApp(App):
         self._save_prefs()
         self.set_status("Ouverture de la page EduConnect...")
         try:
-            self.popup = self.POPUP_CLS(link, self._popup_done, self._popup_error)
+            web_link = desktop_link(link)
+            log("la fenêtre ouvre la page ordinateur de Pronote (hôte : %s)", urlparse(web_link).netloc)
+            self.popup = self.POPUP_CLS(web_link, lambda u, c, tr="", ua="": self._popup_done(link, c, tr, ua), self._popup_error)
             self.popup.open()
         except Exception as e:
             self._popup_error("ERR %s" % e)
@@ -1147,12 +1206,12 @@ class PronoteApp(App):
         else:
             self.set_status("La page EduConnect n'a pas pu s'ouvrir. Ouvre le Journal, copie-le et envoie-le moi. [%s]" % msg.replace("ERR ", "")[:150])
 
-    def _popup_done(self, url, cookies, trail=""):
+    def _popup_done(self, url, cookies, trail="", ua=""):
         if not any(cookies.values() if isinstance(cookies, dict) else [cookies]):
             self.set_status("Aucune connexion détectée. Réessaie. [%s]" % trail)
             return
         self.set_status("Connexion à Pronote...")
-        self._start("web", {"link": url, "cookies": cookies, "trail": trail})
+        self._start("web", {"link": url, "cookies": cookies, "trail": trail, "ua": ua})
 
     def _start(self, kind, p):
         self.busy = True
@@ -1177,17 +1236,36 @@ class PronoteApp(App):
             import pronotepy
             c = None
             if kind == "web":
-                jar = cookie_jar(p["cookies"], p["link"])
+                import pronotepy.pronoteAPI as pa
+                host = urlparse(p["link"]).hostname
+                jar_all = cookie_jar(p["cookies"], p["link"])
+                jar_cas = cookie_jar({u: ck for u, ck in p["cookies"].items() if urlparse(u).hostname != host}, p["link"])
+                variants = link_variants(p["link"])
+                ua = p.get("ua") or ""
+                default_ua = pa.HEADERS["User-Agent"]
+                # (cookies, user-agent, adresse) : on essaie plusieurs combinaisons, chacune est notée dans le journal
+                tries = [("tous les cookies", jar_all, default_ua, variants[0]), ("tous les cookies + UA de la fenêtre", jar_all, ua, variants[0]),
+                         ("cookies EduConnect seulement", jar_cas, default_ua, variants[0]),
+                         ("tous les cookies, lien complet", jar_all, default_ua, variants[-1])]
+                if len(variants) > 2:
+                    tries.append(("tous les cookies, avec ?identifiant", jar_all, default_ua, variants[1]))
                 last = None
-                for i, v in enumerate(link_variants(p["link"])):
+                for i, (label, jar, agent, v) in enumerate(tries):
+                    if not agent:
+                        continue
                     try:
-                        c = pronotepy.Client(v, username="webview", password="webview", ent=lambda *a, **k: jar)
-                        log("connexion : adresse n°%d acceptée par Pronote", i + 1)
+                        pa.HEADERS["User-Agent"] = agent
+                        c = pronotepy.Client(v, username="webview", password="webview", ent=lambda *a, jar=jar, **k: jar)
+                        log("connexion : essai n°%d accepté par Pronote (%s)", i + 1, label)
                         break
                     except Exception as e:
                         last = e
-                        log("connexion : adresse n°%d refusée (%s : %s)", i + 1, type(e).__name__, str(e)[:80])
+                        log("connexion : essai n°%d refusé (%s) : %s", i + 1, label, type(e).__name__)
+                    finally:
+                        pa.HEADERS["User-Agent"] = default_ua
                 if c is None:
+                    for line in diagnose(jar_all, variants[0], ua):  # ce que Pronote répond vraiment avec nos cookies
+                        log("diagnostic : %s", line)
                     raise last
                 try:  # on échange la session contre un jeton : prochaines connexions sans refaire EduConnect
                     pin = "".join(random.choice("123456789") for _ in range(4))
