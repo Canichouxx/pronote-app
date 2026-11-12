@@ -30,7 +30,7 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy.utils import platform
 
-APP_VERSION = "bulles-1"
+APP_VERSION = "neon-1"
 WEB_OK = platform == "android" or bool(os.environ.get("PRONOTE_TEST_WEB"))  # fenêtre EduConnect : Android seulement
 Window.softinput_mode = "below_target"
 
@@ -302,23 +302,34 @@ def build_data(c):
 
 
 # =====================================================================================
-#  Thèmes, taille du texte, animations (réglages d'accessibilité)
+#  Thèmes, taille du texte, animations, effets lumineux (réglages d'accessibilité)
 # =====================================================================================
+_PLAIN = dict(bg=(.05, .06, .11, 1), card=(.11, .12, .20, 1), card2=(.16, .17, .28, 1), text=(.96, .96, .99, 1),
+              sub=(.68, .70, .82, 1), acc=(.58, .52, 1, 1), acc2=(.58, .52, 1, 1), on_acc=(0, 0, 0, 1), track=(.22, .23, .36, 1),
+              deco=(.58, .52, 1, .08), glow=None, grad=None)
 THEMES = {
-    "dark": dict(bg=(.05, .06, .11, 1), card=(.11, .12, .20, 1), card2=(.16, .17, .28, 1), text=(.96, .96, .99, 1),
-                 sub=(.68, .70, .82, 1), acc=(.58, .52, 1, 1), on_acc=(0, 0, 0, 1), track=(.22, .23, .36, 1), deco=(.58, .52, 1, .08)),
+    # néon : fond spatial, bords et halos lumineux cyan / violet
+    "neon": dict(bg=(.01, .02, .06, 1), grad=((.03, .06, .18, 1), (.005, .01, .04, 1)), card=(.05, .08, .18, 1), card2=(.08, .13, .28, 1),
+                 text=(.95, .98, 1, 1), sub=(.62, .74, .92, 1), acc=(.10, .92, 1, 1), acc2=(.76, .32, 1, 1), on_acc=(0, .04, .07, 1),
+                 track=(.11, .16, .32, 1), deco=(.10, .92, 1, .07), glow=(.10, .92, 1)),
+    "plain": _PLAIN,
     "light": dict(bg=(.94, .95, .99, 1), card=(1, 1, 1, 1), card2=(.89, .91, .98, 1), text=(.07, .08, .14, 1),
-                  sub=(.34, .36, .48, 1), acc=(.33, .27, .83, 1), on_acc=(1, 1, 1, 1), track=(.82, .85, .94, 1), deco=(.33, .27, .83, .09)),
+                  sub=(.34, .36, .48, 1), acc=(.33, .27, .83, 1), acc2=(.33, .27, .83, 1), on_acc=(1, 1, 1, 1), track=(.82, .85, .94, 1),
+                  deco=(.33, .27, .83, .09), glow=None, grad=None),
     "contrast": dict(bg=(0, 0, 0, 1), card=(.09, .09, .09, 1), card2=(.19, .19, .19, 1), text=(1, 1, 1, 1),
-                     sub=(.92, .92, .92, 1), acc=(1, .85, 0, 1), on_acc=(0, 0, 0, 1), track=(.35, .35, .35, 1), deco=(1, 1, 1, 0)),
+                     sub=(.92, .92, .92, 1), acc=(1, .85, 0, 1), acc2=(1, .85, 0, 1), on_acc=(0, 0, 0, 1), track=(.35, .35, .35, 1),
+                     deco=(1, 1, 1, 0), glow=None, grad=None),
 }
-TH = dict(THEMES["dark"])
-PREFS = {"scale": 1.0, "theme": "dark", "anim": True, "link": ""}
+TH = dict(THEMES["neon"])
+PREFS = {"scale": 1.0, "theme": "neon", "anim": True, "glow": True, "link": ""}
 
 
 def apply_theme():
     TH.clear()
-    TH.update(THEMES.get(PREFS["theme"], THEMES["dark"]))
+    TH.update(THEMES.get(PREFS["theme"], THEMES["neon"]))
+    if not PREFS.get("glow", True):  # effets lumineux coupés (confort visuel / fatigue)
+        TH["glow"] = None
+        TH["grad"] = None
     Window.clearcolor = TH["bg"]
 
 
@@ -330,28 +341,54 @@ def R(n):
     return dp(n)
 
 
+def vgrad(top, bottom):
+    """Petite texture en dégradé vertical."""
+    from kivy.graphics.texture import Texture
+    tex = Texture.create(size=(1, 2), colorfmt="rgba")
+    tex.blit_buffer(bytes(int(c * 255) for c in list(bottom) + list(top)), colorfmt="rgba", bufferfmt="ubyte")
+    tex.mag_filter = tex.min_filter = "linear"
+    return tex
+
+
 # =====================================================================================
-#  Éléments « bulles »
+#  Éléments « bulles » lumineux
 # =====================================================================================
 class Bubble(BoxLayout):
-    """Conteneur tout rond (coins très arrondis)."""
+    """Conteneur tout rond, avec un liseré et un halo lumineux (thème néon)."""
 
-    def __init__(self, fill=None, radius=26, auto=False, **kw):
+    def __init__(self, fill=None, radius=26, auto=False, glow=True, halo=None, **kw):
         kw.setdefault("padding", R(16))
         kw.setdefault("spacing", R(6))
         super().__init__(**kw)
         self.radius = radius
+        g = halo or (TH.get("glow") if glow else None)
+        self._halo, self._edge = [], None
         with self.canvas.before:
+            if g:
+                for a in (0.11, 0.065, 0.03):
+                    Color(g[0], g[1], g[2], a)
+                    self._halo.append(RoundedRectangle())
             self._c = Color(*(fill or TH["card"]))
             self._r = RoundedRectangle(radius=[R(radius)])
+            if g:
+                Color(g[0], g[1], g[2], 0.55)
+                self._edge = Line(width=R(1.1))
         self.bind(pos=self._u, size=self._u)
         if auto:
             self.size_hint_y = None
             self.bind(minimum_height=self.setter("height"))
 
     def _u(self, *_):
-        self._r.pos, self._r.size = self.pos, self.size
-        self._r.radius = [min(R(self.radius), self.height / 2)]
+        x, y = self.pos
+        w, h = self.size
+        rad = min(R(self.radius), h / 2, w / 2)
+        self._r.pos, self._r.size, self._r.radius = self.pos, self.size, [rad]
+        for i, rr in enumerate(self._halo):
+            d = R(3 + 3 * i)
+            rr.pos, rr.size = (x - d, y - d), (w + 2 * d, h + 2 * d)
+            rr.radius = [min(rad + d, (h + 2 * d) / 2, (w + 2 * d) / 2)]
+        if self._edge is not None and w > 2 and h > 2:
+            self._edge.rounded_rectangle = (x, y, w, h, rad)
 
 
 class Txt(Label):
@@ -382,18 +419,29 @@ def row(*widgets, **kw):
 
 
 class Disc(FloatLayout):
-    """Rond avec un texte au centre, et un anneau de progression facultatif."""
+    """Rond lumineux avec un texte au centre, et un anneau de progression facultatif."""
 
-    def __init__(self, text="", fill=None, text_color=None, size=64, font=20, ring=None, ring_color=None, **kw):
+    def __init__(self, text="", fill=None, text_color=None, size=64, font=20, ring=None, ring_color=None, glow=True, **kw):
         super().__init__(size_hint=(None, None), size=(R(size), R(size)), **kw)
         self.ring, self.fill = ring, fill
         self.ring_color = ring_color or TH["acc"]
+        base = (fill or self.ring_color)[:3]
+        g = base if (glow and TH.get("glow")) else None
+        self._halo, self._rhalo = [], []
         with self.canvas.before:
+            if g:
+                for a in (0.20, 0.11, 0.05):
+                    Color(g[0], g[1], g[2], a)
+                    self._halo.append(Ellipse())
             self._fc = Color(*(fill or TH["card2"]))
             self._e = Ellipse()
             if ring is not None:
                 self._tc = Color(*TH["track"])
                 self._tl = Line(width=R(7))
+                if g:
+                    for wd, a in ((15, 0.10), (11, 0.18)):
+                        Color(self.ring_color[0], self.ring_color[1], self.ring_color[2], a)
+                        self._rhalo.append((Line(width=R(wd), cap="round"), wd))
                 self._rc = Color(*self.ring_color)
                 self._rl = Line(width=R(7), cap="round")
         self.lab = Label(text=text, font_size=fs(font), bold=True, color=text_color or TH["text"], halign="center", valign="middle",
@@ -405,23 +453,28 @@ class Disc(FloatLayout):
     def _u(self, *_):
         x, y = self.pos
         w, h = self.size
-        if self.ring is None:
-            self._e.pos, self._e.size = self.pos, self.size
-        else:  # anneau : le disque est un peu plus petit
-            pad = R(11)
-            self._e.pos, self._e.size = (x + pad, y + pad), (w - 2 * pad, h - 2 * pad)
+        pad = R(11) if self.ring is not None else 0
+        self._e.pos, self._e.size = (x + pad, y + pad), (w - 2 * pad, h - 2 * pad)
+        for i, e in enumerate(self._halo):
+            d = R(3 + 3 * i)
+            e.pos, e.size = (x + pad - d, y + pad - d), (w - 2 * pad + 2 * d, h - 2 * pad + 2 * d)
+        if self.ring is not None:
             cx, cy, r = x + w / 2, y + h / 2, w / 2 - R(4)
             self._tl.circle = (cx, cy, r)
-            self._rl.circle = (cx, cy, r, 0, 360 * max(0.001, min(1, self.ring)))
+            end = 360 * max(0.001, min(1, self.ring))
+            for ln, _ in self._rhalo:
+                ln.circle = (cx, cy, r, 0, end)
+            self._rl.circle = (cx, cy, r, 0, end)
 
 
 class PillButton(ButtonBehavior, Bubble):
-    """Gros bouton arrondi (zone de toucher confortable)."""
+    """Gros bouton arrondi (zone de toucher confortable), lumineux quand il est mis en avant."""
 
     def __init__(self, text, kind="card", size=16, height=56, on=None, **kw):
         hh = R(height) * (1 + (PREFS["scale"] - 1) * 0.55)
         fill = TH["acc"] if kind == "acc" else TH["card2"]
-        super().__init__(fill=fill, radius=height, size_hint_y=None, height=hh, padding=(R(18), 0), **kw)
+        super().__init__(fill=fill, radius=height, size_hint_y=None, height=hh, padding=(R(18), 0),
+                         glow=(kind == "acc"), **kw)
         self.lab = Label(text=text, font_size=fs(size), bold=True, color=TH["on_acc"] if kind == "acc" else TH["text"],
                          halign="center", valign="middle")
         self.lab.bind(size=lambda i, v: setattr(i, "text_size", v))
@@ -434,12 +487,40 @@ class PillButton(ButtonBehavior, Bubble):
         self.lab.text = t
 
 
-def segmented(options, current, on_pick):
-    """Une rangée de gros boutons ronds : un seul est sélectionné."""
-    b = BoxLayout(size_hint_y=None, spacing=R(8), height=R(52) * (1 + (PREFS["scale"] - 1) * 0.55))
-    for value, label in options:
-        b.add_widget(PillButton(label, "acc" if value == current else "card", size=14, height=52, on=lambda v=value: on_pick(v)))
-    return b
+def segmented(options, current, on_pick, per_row=3):
+    """Des gros boutons ronds, sur une ou plusieurs lignes : un seul est sélectionné."""
+    box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=R(8))
+    box.bind(minimum_height=box.setter("height"))
+    hh = R(52) * (1 + (PREFS["scale"] - 1) * 0.55)
+    for i in range(0, len(options), per_row):
+        r = BoxLayout(size_hint_y=None, spacing=R(8), height=hh)
+        for value, label in options[i:i + per_row]:
+            r.add_widget(PillButton(label, "acc" if value == current else "card", size=14, height=52, on=lambda v=value: on_pick(v)))
+        box.add_widget(r)
+    return box
+
+
+def neon_bar(width=56):
+    """Petit trait lumineux sous les titres."""
+    w = Widget(size_hint=(None, None), size=(R(width), R(4)))
+    g = TH.get("glow") or TH["acc"][:3]
+    with w.canvas:
+        halos = []
+        if TH.get("glow"):
+            for a in (0.10, 0.18):
+                Color(g[0], g[1], g[2], a)
+                halos.append(RoundedRectangle())
+        Color(*TH["acc"])
+        core = RoundedRectangle(radius=[R(2)])
+
+    def upd(*_):
+        for i, rr in enumerate(halos):
+            d = R(4 - 2 * i)
+            rr.pos, rr.size = (w.x - d, w.y - d), (w.width + 2 * d, w.height + 2 * d)
+            rr.radius = [R(4)]
+        core.pos, core.size = w.pos, w.size
+    w.bind(pos=upd, size=upd)
+    return w
 
 
 class BarRow(BoxLayout):
@@ -456,15 +537,24 @@ class BarRow(BoxLayout):
         with bar.canvas:
             Color(*TH["track"])
             self._t = RoundedRectangle(radius=[R(7)])
+            if TH.get("glow"):
+                Color(s["color"][0], s["color"][1], s["color"][2], 0.22)
+                self._g = RoundedRectangle(radius=[R(9)])
+            else:
+                self._g = None
             Color(*s["color"])
             self._f = RoundedRectangle(radius=[R(7)])
             Color(*TH["text"])
             self._m = Rectangle()
+
         def upd(*_):
             x, y = bar.pos
             w, h = bar.size
+            fw = max(h, w * min(1, (avg or 0) / 20))
             self._t.pos, self._t.size = (x, y), (w, h)
-            self._f.pos, self._f.size = (x, y), (max(h, w * min(1, (avg or 0) / 20)), h)
+            self._f.pos, self._f.size = (x, y), (fw, h)
+            if self._g is not None:
+                self._g.pos, self._g.size = (x - R(2), y - R(3)), (fw + R(4), h + R(6))
             if cls is not None:
                 self._m.pos, self._m.size = (x + w * min(1, cls / 20) - R(1.5), y - R(2)), (R(3), h + R(4))
             else:
@@ -481,12 +571,21 @@ class HistCol(BoxLayout):
         self.add_widget(Txt(str(count), 13, "text", bold=True, halign="center"))
         area = Widget()
         with area.canvas:
+            if TH.get("glow"):
+                Color(color[0], color[1], color[2], 0.2)
+                hr = RoundedRectangle(radius=[R(10)])
+            else:
+                hr = None
             Color(*color)
             rr = RoundedRectangle(radius=[R(8)])
+
         def upd(*_):
             h = area.height * (count / top if top else 0)
+            hh = max(h, R(4) if count else 0)
             rr.pos = (area.x + area.width * 0.18, area.y)
-            rr.size = (area.width * 0.64, max(h, R(4) if count else 0))
+            rr.size = (area.width * 0.64, hh)
+            if hr is not None:
+                hr.pos, hr.size = (rr.pos[0] - R(2), rr.pos[1] - R(2)), (rr.size[0] + R(4), (rr.size[1] + R(4)) if count else 0)
         area.bind(pos=upd, size=upd)
         self.add_widget(area)
         self.add_widget(Txt(label, 11, "sub", halign="center"))
@@ -501,7 +600,7 @@ class Histogram(BoxLayout):
 
 
 class Spark(Widget):
-    """Courbe des dernières notes."""
+    """Courbe lumineuse des dernières notes."""
 
     def __init__(self, vals, **kw):
         super().__init__(size_hint_y=None, height=R(110), **kw)
@@ -509,6 +608,14 @@ class Spark(Widget):
         with self.canvas:
             Color(*TH["track"])
             self._g = Line(width=R(1))
+            if TH.get("glow"):
+                acc = TH["acc"]
+                Color(acc[0], acc[1], acc[2], 0.14)
+                self._h2 = Line(width=R(10), joint="round", cap="round")
+                Color(acc[0], acc[1], acc[2], 0.25)
+                self._h1 = Line(width=R(6), joint="round", cap="round")
+            else:
+                self._h1 = self._h2 = None
             Color(*TH["acc"])
             self._l = Line(width=R(3), joint="round", cap="round")
             self._dots = [Ellipse() for _ in vals]
@@ -527,7 +634,9 @@ class Spark(Widget):
             y = self.y + pad + (self.height - 2 * pad) * (v - lo) / span
             pts += [x, y]
             self._dots[i].pos, self._dots[i].size = (x - R(5), y - R(5)), (R(10), R(10))
-        self._l.points = pts
+        for ln in (self._h1, self._h2, self._l):
+            if ln is not None:
+                ln.points = pts
         self._g.points = [self.x, self.y + R(1), self.right, self.y + R(1)]
 
 
@@ -552,8 +661,12 @@ class NavIcon(Widget):
         w = max(R(1.8), R(1.8) * PREFS["scale"] * 0.8)
         with self.canvas:
             if self.p > 0:
-                Color(acc[0], acc[1], acc[2], 0.22 * self.p)
                 r = s * 1.9
+                if TH.get("glow"):
+                    for k, a in ((1.55, 0.07), (1.25, 0.12)):
+                        Color(acc[0], acc[1], acc[2], a * self.p)
+                        Ellipse(pos=(cx - r * k, cy - r * k), size=(2 * r * k, 2 * r * k))
+                Color(acc[0], acc[1], acc[2], 0.22 * self.p)
                 Ellipse(pos=(cx - r, cy - r), size=(2 * r, 2 * r))
             Color(*colr, 1)
             if self.kind == "home":
@@ -611,17 +724,37 @@ class Page(Screen):
 
 
 def deco(widget):
-    """Quelques grosses bulles transparentes en fond (pour l'ambiance)."""
+    """Fond du thème : dégradé spatial et grosses bulles de lumière (néon), ou simples bulles transparentes."""
+    glow = TH.get("glow")
     with widget.canvas.before:
-        Color(*TH["deco"])
-        els = [Ellipse() for _ in range(4)]
-    spec = [(0.78, 0.82, 0.55), (-0.12, 0.45, 0.42), (0.62, 0.08, 0.34), (0.10, 0.92, 0.26)]
+        grad = None
+        if TH.get("grad"):
+            Color(1, 1, 1, 1)
+            grad = Rectangle(texture=vgrad(*TH["grad"]))
+        orbs = []
+        if glow:
+            for fx, fy, fr, colr in ((0.55, 0.62, 0.95, TH["acc"]), (-0.35, 0.05, 0.90, TH["acc2"]), (0.15, -0.30, 0.80, TH["acc"])):
+                layers = []
+                for k in range(8):
+                    Color(colr[0], colr[1], colr[2], 0.012 + 0.003 * k)
+                    layers.append(Ellipse())
+                orbs.append((layers, fx, fy, fr))
+        else:
+            Color(*TH["deco"])
+            for fx, fy, fr in ((0.78, 0.82, 0.55), (-0.12, 0.45, 0.42), (0.62, 0.08, 0.34), (0.10, 0.92, 0.26)):
+                orbs.append(([Ellipse()], fx, fy, fr))
 
     def upd(*_):
-        for e, (fx, fy, fr) in zip(els, spec):
-            d = widget.width * fr
-            e.size = (d, d)
-            e.pos = (widget.x + widget.width * fx, widget.y + widget.height * fy)
+        if grad is not None:
+            grad.pos, grad.size = widget.pos, widget.size
+        for layers, fx, fy, fr in orbs:
+            n = len(layers)
+            for k, e in enumerate(layers):
+                d = widget.width * fr * (1 - k / (n + 1)) if glow else widget.width * fr
+                cx = widget.x + widget.width * (fx + fr / 2)
+                cy = widget.y + widget.height * fy + widget.width * fr / 2
+                e.size = (d, d)
+                e.pos = (cx - d / 2, cy - d / 2)
     widget.bind(pos=upd, size=upd)
 
 
@@ -709,7 +842,7 @@ class EduPopup:
         try:
             self._step("import android.runnable")
             self._ui(self._build)
-            self._ev = Clock.schedule_interval(self._poll, 0.4)
+            self._ev = Clock.schedule_interval(self._poll, 0.2)
         except Exception as e:
             self._fail("%s : %s : %s" % (self.step, type(e).__name__, str(e)[:100]))
 
@@ -797,7 +930,7 @@ class EduPopup:
             return False
         self._ui(self._read)
         self.ticks += 1
-        if self.flow.update(self.cur_url, self.cookie, self.hosts):  # retour sur Pronote après EduConnect
+        if self.flow.update(self.cur_url, any(self.cookies.values()), self.hosts):  # retour sur Pronote après EduConnect
             self._finish()
             return False
         if self.was_showing and not self.showing:  # fenêtre fermée avec le bouton Retour
@@ -816,10 +949,24 @@ class EduPopup:
         self._close()
         Clock.schedule_once(lambda _: self.on_error("Connexion annulée."))
 
+    def _cover(self):
+        """Cache tout de suite la page Pronote (elle ne sert à rien : on a déjà la session)."""
+        def hide():
+            try:
+                self.web.stopLoading()
+                self.web.setVisibility(4)  # INVISIBLE
+            except Exception:
+                pass
+        try:
+            self._ui(hide)
+        except Exception:
+            pass
+
     def _finish(self):
         if self.finished:
             return
         self.finished = True
+        self._cover()
         cookies = {u: c for u, c in self.cookies.items() if c}
         for c in cookies.values():  # valeurs des cookies : jamais dans le journal
             SECRETS.update(p.partition("=")[2].strip() for p in c.split(";"))
@@ -982,8 +1129,8 @@ class PronoteApp(App):
         if PREFS["link"]:
             register_link_secrets(PREFS["link"])
         creds = self._load_json("creds.json")
-        log("réglages : taille %s, thème %s, animations %s | lien enregistré : %s | jeton enregistré : %s",
-            PREFS["scale"], PREFS["theme"], PREFS["anim"], bool(PREFS["link"]), bool(creds))
+        log("réglages : taille %s, thème %s, animations %s, effets lumineux %s | lien enregistré : %s | jeton enregistré : %s",
+            PREFS["scale"], PREFS["theme"], PREFS["anim"], PREFS["glow"], bool(PREFS["link"]), bool(creds))
         if creds:
             self.set_status("Reconnexion...")
             self._start("token", creds)
@@ -1009,8 +1156,10 @@ class PronoteApp(App):
         for k in PREFS:
             if k in p:
                 PREFS[k] = p[k]
+        if PREFS["theme"] == "dark":  # ancien nom : le thème sombre est devenu « Néon » (l'ancien aspect s'appelle « Simple »)
+            PREFS["theme"] = "neon"
         if PREFS["theme"] not in THEMES:
-            PREFS["theme"] = "dark"
+            PREFS["theme"] = "neon"
         PREFS["scale"] = min(1.6, max(1.0, float(PREFS["scale"] or 1.0)))
 
     def _save_prefs(self):
@@ -1078,12 +1227,9 @@ class PronoteApp(App):
             self.pages_sm.add_widget(self.pg[k])
         fl.add_widget(self.pages_sm)
         n = len(titles)
-        nav = BoxLayout(size_hint=(None, None), width=min(Window.width - R(20), R(520)), height=R(66) * (1 + (PREFS["scale"] - 1) * 0.55),
-                        pos_hint={"center_x": .5, "y": 0.012}, padding=(R(8), R(4)))
-        with nav.canvas.before:
-            Color(*TH["card2"])
-            rr = RoundedRectangle(pos=nav.pos, size=nav.size, radius=[nav.height / 2])
-        nav.bind(pos=lambda *_: setattr(rr, "pos", nav.pos), size=lambda *_: (setattr(rr, "size", nav.size), setattr(rr, "radius", [nav.height / 2])))
+        nav = Bubble(fill=TH["card2"], radius=40, orientation="horizontal", size_hint=(None, None), spacing=0,
+                     width=min(Window.width - R(20), R(520)), height=R(66) * (1 + (PREFS["scale"] - 1) * 0.55),
+                     pos_hint={"center_x": .5, "y": 0.012}, padding=(R(8), R(4)))
         self.tabs = {}
         for k, t in titles:
             tab = NavTab(k if k != "grades" else "grades", t)
@@ -1110,7 +1256,9 @@ class PronoteApp(App):
             b.add_widget(widget)
             box.add_widget(b)
         section("Taille du texte", segmented([(1.0, "Normal"), (1.25, "Grand"), (1.5, "Très grand")], PREFS["scale"], lambda v: self.set_pref("scale", v)))
-        section("Thème", segmented([("dark", "Sombre"), ("light", "Clair"), ("contrast", "Contraste")], PREFS["theme"], lambda v: self.set_pref("theme", v)))
+        section("Thème", segmented([("neon", "Néon"), ("plain", "Simple"), ("light", "Clair"), ("contrast", "Contraste")], PREFS["theme"],
+                                   lambda v: self.set_pref("theme", v), per_row=2))
+        section("Effets lumineux (halos, dégradés)", segmented([(True, "Oui"), (False, "Non")], PREFS["glow"], lambda v: self.set_pref("glow", v)))
         section("Animations", segmented([(True, "Oui"), (False, "Non")], PREFS["anim"], lambda v: self.set_pref("anim", v)))
         acts = Bubble(orientation="vertical", auto=True, padding=R(16), spacing=R(10))
         acts.add_widget(Txt("Compte", 16, "text", bold=True))
@@ -1364,7 +1512,7 @@ class PronoteApp(App):
         self.pg["edt"].fill(self._edt(d, s))
 
     def _title(self, t, sub=""):
-        w = [Txt(t, 28, "text", bold=True)]
+        w = [Txt(t, 28, "text", bold=True), neon_bar()]
         if sub:
             w.append(Txt(sub, 13, "sub"))
         return w
